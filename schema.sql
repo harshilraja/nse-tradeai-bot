@@ -4,12 +4,13 @@
 -- ═══════════════════════════════════════════════════════════════════════════
 
 -- ─── SIGNALS: every signal generated, even if not executed ─────────────────
+SET statement_timeout = '30s';
 CREATE TABLE IF NOT EXISTS signals (
   id              SERIAL PRIMARY KEY,
   signal_id       VARCHAR(64) UNIQUE NOT NULL,
   symbol          VARCHAR(32) NOT NULL,
-  signal_type     VARCHAR(8) NOT NULL,        -- BUY / SELL / HOLD
-  order_type      VARCHAR(8),                 -- MIS / CNC
+  signal_type     VARCHAR(8) NOT NULL,
+  order_type      VARCHAR(8),
   confidence      DECIMAL(5,2),
   score           DECIMAL(5,2),
   entry           DECIMAL(10,2),
@@ -24,7 +25,7 @@ CREATE TABLE IF NOT EXISTS signals (
   bull_count      INTEGER,
   bear_count      INTEGER,
   safe_to_trade   BOOLEAN,
-  action_taken    VARCHAR(16),                -- executed_live / executed_paper / skipped / expired
+  action_taken    VARCHAR(16),
   created_at      TIMESTAMP DEFAULT NOW()
 );
 
@@ -38,9 +39,9 @@ CREATE TABLE IF NOT EXISTS trades (
   trade_id        VARCHAR(64) UNIQUE NOT NULL,
   signal_id       VARCHAR(64) REFERENCES signals(signal_id),
   symbol          VARCHAR(32) NOT NULL,
-  mode            VARCHAR(8) NOT NULL,        -- live / paper
-  side            VARCHAR(8) NOT NULL,        -- BUY / SELL
-  order_type      VARCHAR(8),                 -- MIS / CNC
+  mode            VARCHAR(8) NOT NULL,
+  side            VARCHAR(8) NOT NULL,
+  order_type      VARCHAR(8),
   broker_order_id VARCHAR(64),
   entry_price     DECIMAL(10,2) NOT NULL,
   exit_price      DECIMAL(10,2),
@@ -49,13 +50,13 @@ CREATE TABLE IF NOT EXISTS trades (
   final_sl        DECIMAL(10,2),
   quantity        INTEGER NOT NULL,
   capital_used    DECIMAL(12,2),
-  status          VARCHAR(16) DEFAULT 'open', -- open / closed
-  exit_reason     VARCHAR(32),                -- TARGET_HIT / SL_HIT / MANUAL / EOD_SQUARE_OFF
+  status          VARCHAR(16) DEFAULT 'open',
+  exit_reason     VARCHAR(32),
   pnl             DECIMAL(12,2),
   pnl_pct         DECIMAL(6,2),
-  max_profit      DECIMAL(12,2),              -- peak unrealized profit
-  max_drawdown    DECIMAL(12,2),              -- max unrealized loss
-  trail_count     INTEGER DEFAULT 0,          -- how many times SL was trailed up
+  max_profit      DECIMAL(12,2),
+  max_drawdown    DECIMAL(12,2),
+  trail_count     INTEGER DEFAULT 0,
   opened_at       TIMESTAMP DEFAULT NOW(),
   closed_at       TIMESTAMP
 );
@@ -81,7 +82,7 @@ CREATE INDEX idx_sl_trade ON sl_movements(trade_id);
 CREATE TABLE IF NOT EXISTS daily_stats (
   id                SERIAL PRIMARY KEY,
   date              DATE UNIQUE NOT NULL,
-  mode              VARCHAR(8) NOT NULL,      -- live / paper
+  mode              VARCHAR(8) NOT NULL,
   trades_taken      INTEGER DEFAULT 0,
   trades_won        INTEGER DEFAULT 0,
   trades_lost       INTEGER DEFAULT 0,
@@ -101,7 +102,7 @@ CREATE UNIQUE INDEX idx_daily_date_mode ON daily_stats(date, mode);
 -- ─── BOT EVENTS: audit log ─────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS bot_events (
   id              SERIAL PRIMARY KEY,
-  event_type      VARCHAR(32) NOT NULL,       -- STARTUP / HALT / RESUME / LOSS_CAP_HIT / ERROR
+  event_type      VARCHAR(32) NOT NULL,       
   message         TEXT,
   metadata        JSONB,
   created_at      TIMESTAMP DEFAULT NOW()

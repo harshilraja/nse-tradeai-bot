@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// NSE TradeAI Bot v4 — Semi-Auto Trading with Telegram
-// Capital: ₹2,50,000 · Risk: ₹1,000/trade · Hybrid Paper + Live · CNC + MIS
+// NSE TradeAI Bot v4 · Complete Production Backend
+// Features: Angel One SmartAPI + Telegram Bot + PostgreSQL + Mobile REST API
 // ═══════════════════════════════════════════════════════════════════════════
 
 import axios from "axios";
@@ -9,20 +9,32 @@ import TelegramBot from "node-telegram-bot-api";
 import WebSocket from "ws";
 import fs from "fs";
 import dotenv from "dotenv";
+import {
+  initDB, logSignal, logTrade, closeTrade as dbCloseTrade,
+  updateSLMovement, logEvent, startAPI
+} from "./db-api.js";
+import { addAccountEndpoints } from "./angel-account-api.js";
+import {
+  preTradeBalanceCheck,
+  calculateSafeQty,
+  getBalanceHealth,
+  BALANCE_CONFIG
+} from "./balance-guard.js";
+
 dotenv.config();
 
-// ─── CONFIG ─────────────────────────────────────────────────────────────────
+// ═══ CONFIG ════════════════════════════════════════════════════════════════
 const CONFIG = {
   CAPITAL:         250000,
-  RISK_PER_TRADE:  1000,          // ₹1,000 for first 2 weeks, then scale
-  REWARD_RATIO:    2,             // 1:2 risk-reward
-  DAILY_LOSS_CAP:  2500,          // auto-halt after this loss
+  RISK_PER_TRADE:  1000,
+  REWARD_RATIO:    2,
+  DAILY_LOSS_CAP:  2500,
   WEEKLY_LOSS_CAP: 7500,
   MAX_POSITIONS:   3,
-  TRAIL_STEP_PCT:  0.5,           // trail SL by 0.5%
+  TRAIL_STEP_PCT:  0.5,
   VIX_DANGER:      20,
-  LIVE_TRADING:    process.env.LIVE_TRADING === "true",  // MUST be explicitly enabled
-  PAPER_TRADING:   true,          // always runs in parallel
+  LIVE_TRADING:    process.env.LIVE_TRADING === "true",
+  PAPER_TRADING:   true,
   WATCHLIST: [
     "RELIANCE","HDFCBANK","TCS","HINDUNILVR","JSWSTEEL","APOLLOHOSP",
     "POWERGRID","TITAN","INFY","ICICIBANK","SBIN","LT","BHARTIARTL",
@@ -38,25 +50,32 @@ const ENV = {
   ANGEL_CLIENT_ID:  process.env.ANGEL_CLIENT_ID,
   ANGEL_API_KEY:    process.env.ANGEL_API_KEY,
   ANGEL_MPIN:       process.env.ANGEL_MPIN,
-  ANGEL_TOTP_TOKEN: process.env.ANGEL_TOTP_TOKEN,  // TOTP secret (not current code)
+  ANGEL_TOTP_TOKEN: process.env.ANGEL_TOTP_TOKEN,
   TELEGRAM_TOKEN:   process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
 };
 
-// ─── STATE ──────────────────────────────────────────────────────────────────
-const state = {
+// ═══ GLOBAL STATE ══════════════════════════════════════════════════════════
+export const state = {
   angelAuth:      null,
   feedToken:      null,
   refreshToken:   null,
   ws:             null,
   livePrices:     new Map(),
-  candleBuffer:   new Map(),         // symbol → [candles]
-  openTrades:     [],                // both paper + live
-  pendingSignals: new Map(),         // signalId → signal (awaiting Telegram tap)
+  candleBuffer:   new Map(),
+  openTrades:     [],
+  pendingSignals: new Map(),
   dayPnL:         { live: 0, paper: 0 },
   totalTrades:    { live: 0, paper: 0 },
   isHalted:       false,
+  symbolTokens:   new Map(),
 };
+
+// ═══ LOGGING ═══════════════════════════════════════════════════════════════
+function log(msg) {
+  const ts = new Date().toISOString().replace("T", " ").substring(0, 19);
+  console.log(`[${ts}] ${msg}`);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1. ANGEL ONE AUTHENTICATION
@@ -74,14 +93,14 @@ async function authenticateAngel() {
       },
       {
         headers: {
-          "Content-Type":        "application/json",
-          "Accept":              "application/json",
-          "X-UserType":          "USER",
-          "X-SourceID":          "WEB",
-          "X-ClientLocalIP":     "192.168.1.1",
-          "X-ClientPublicIP":    "103.0.0.1",
-          "X-MACAddress":        "00:00:00:00:00:00",
-          "X-PrivateKey":        ENV.ANGEL_API_KEY,
+          "Content-Type":     "application/json",
+          "Accept":           "application/json",
+          "X-UserType":       "USER",
+          "X-SourceID":       "WEB",
+          "X-ClientLocalIP":  "192.168.1.1",
+          "X-ClientPublicIP": "103.0.0.1",
+          "X-MACAddress":     "00:00:00:00:00:00",
+          "X-PrivateKey":     ENV.ANGEL_API_KEY,
         },
       }
     );
@@ -90,20 +109,61 @@ async function authenticateAngel() {
       state.feedToken    = res.data.data.feedToken;
       state.refreshToken = res.data.data.refreshToken;
       log("✅ Angel One authenticated");
+      await logEvent("ANGEL_AUTH_SUCCESS", "Angel One authenticated");
       return true;
     }
     throw new Error(res.data?.message || "Auth failed");
   } catch (e) {
     log(`❌ Auth failed: ${e.message}`);
+    await logEvent("ANGEL_AUTH_FAIL", e.message);
     return false;
   }
 }
 
+// Re-authenticate every 6 hours (Angel tokens expire in 8 hours)
+setInterval(async () => {
+  log("🔄 Refreshing Angel One auth token...");
+  await authenticateAngel();
+}, 6 * 60 * 60 * 1000);
+
 // ═══════════════════════════════════════════════════════════════════════════
-// 2. WEBSOCKET LIVE PRICE FEED
+// 2. SYMBOL TOKEN RESOLVER
+// ═══════════════════════════════════════════════════════════════════════════
+async function getSymbolToken(symbol) {
+  if (state.symbolTokens.has(symbol)) return state.symbolTokens.get(symbol);
+
+  const cachePath = "./scrip-master.json";
+  let master;
+  try {
+    if (fs.existsSync(cachePath)) {
+      master = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+    } else {
+      log("⬇️ Downloading Angel scrip master (one-time)...");
+      const res = await axios.get(
+        "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
+        { timeout: 60000 }
+      );
+      master = res.data;
+      fs.writeFileSync(cachePath, JSON.stringify(master));
+      log(`✓ Cached ${master.length} scrips`);
+    }
+    const match = master.find(s => s.symbol === `${symbol}-EQ` && s.exch_seg === "NSE");
+    if (match?.token) {
+      state.symbolTokens.set(symbol, match.token);
+      return match.token;
+    }
+  } catch (e) {
+    log(`⚠️ Could not resolve ${symbol}: ${e.message}`);
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3. WEBSOCKET LIVE PRICE FEED
 // ═══════════════════════════════════════════════════════════════════════════
 async function startWebSocket(tokens) {
   const wsUrl = `wss://smartapisocket.angelone.in/smart-stream?clientCode=${ENV.ANGEL_CLIENT_ID}&feedToken=${state.feedToken}&apiKey=${ENV.ANGEL_API_KEY}`;
+
   state.ws = new WebSocket(wsUrl);
 
   state.ws.on("open", () => {
@@ -112,7 +172,7 @@ async function startWebSocket(tokens) {
       correlationID: "nseaibot",
       action: 1,
       params: {
-        mode: 3,  // snap quote
+        mode: 3,
         tokenList: [{ exchangeType: 1, tokens }]
       }
     };
@@ -122,15 +182,27 @@ async function startWebSocket(tokens) {
   state.ws.on("message", (data) => {
     try {
       const tick = parseBinaryTick(data);
-      if (tick?.symbol) {
-        state.livePrices.set(tick.symbol, {
-          ltp:       tick.ltp,
-          volume:    tick.volume,
-          timestamp: Date.now(),
-        });
-        updateCandles(tick.symbol, tick.ltp, tick.volume);
+      if (tick?.token) {
+        const symbol = [...state.symbolTokens.entries()].find(([s, t]) => t === tick.token)?.[0];
+        if (symbol) {
+          const change = state.livePrices.get(symbol)?.openPrice
+            ? tick.ltp - state.livePrices.get(symbol).openPrice
+            : 0;
+          const changePct = state.livePrices.get(symbol)?.openPrice
+            ? (change / state.livePrices.get(symbol).openPrice) * 100
+            : 0;
+          state.livePrices.set(symbol, {
+            ltp:       tick.ltp,
+            volume:    tick.volume,
+            change:    parseFloat(change.toFixed(2)),
+            changePct: parseFloat(changePct.toFixed(2)),
+            openPrice: state.livePrices.get(symbol)?.openPrice || tick.ltp,
+            timestamp: Date.now(),
+          });
+          updateCandles(symbol, tick.ltp, tick.volume);
+        }
       }
-    } catch (e) { /* swallow tick parse errors */ }
+    } catch (e) { /* ignore parse errors */ }
   });
 
   state.ws.on("close", () => {
@@ -140,26 +212,23 @@ async function startWebSocket(tokens) {
 
   state.ws.on("error", (e) => log(`⚠️ WS error: ${e.message}`));
 
-  // Heartbeat every 30s
   setInterval(() => {
     if (state.ws?.readyState === WebSocket.OPEN) state.ws.ping();
   }, 30000);
 }
 
 function parseBinaryTick(buffer) {
-  // Simplified — real Angel binary parser is more detailed
-  // See: https://smartapi.angelbroking.com/docs/WebSocket2
   if (buffer.length < 51) return null;
   try {
+    const token = buffer.readBigInt64LE(2).toString();
     const ltp = buffer.readInt32LE(43) / 100;
-    const vol = buffer.readInt32LE(51);
-    // Symbol lookup from token → done via subscription map (stored separately)
-    return { ltp, volume: vol };
+    const volume = buffer.length >= 55 ? buffer.readInt32LE(51) : 0;
+    return { token, ltp, volume };
   } catch { return null; }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 3. CANDLE AGGREGATOR — builds 5-min candles from live ticks
+// 4. CANDLE AGGREGATOR
 // ═══════════════════════════════════════════════════════════════════════════
 function updateCandles(symbol, ltp, vol) {
   if (!state.candleBuffer.has(symbol)) {
@@ -183,7 +252,7 @@ function updateCandles(symbol, ltp, vol) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 4. TECHNICAL INDICATORS
+// 5. TECHNICAL INDICATORS
 // ═══════════════════════════════════════════════════════════════════════════
 function ema(closes, period) {
   const k = 2 / (period + 1);
@@ -212,7 +281,7 @@ function macd(closes) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 5. STRATEGY ENGINE — decides MIS vs CNC based on signal strength
+// 6. STRATEGY ENGINE
 // ═══════════════════════════════════════════════════════════════════════════
 function analyzeSignal(symbol, candles) {
   if (candles.length < 50) return null;
@@ -227,7 +296,6 @@ function analyzeSignal(symbol, candles) {
   const volRatio = vols[vols.length - 1] / avgVol;
   const price = closes[closes.length - 1];
 
-  // Score
   let score = 0;
   let bullCount = 0, bearCount = 0;
   const checks = {};
@@ -250,13 +318,9 @@ function analyzeSignal(symbol, candles) {
   if (score >= 4) { signal = "BUY"; confidence = Math.min(45 + score * 4, 75); }
   else if (score <= -4) { signal = "SELL"; confidence = Math.min(45 + Math.abs(score) * 4, 73); }
 
-  // CNC vs MIS decision
   const maxConfluence = Math.max(bullCount, bearCount);
   const orderType = (maxConfluence === 3 && volRatio > 1.5 && confidence > 60) ? "CNC" : "MIS";
-  // CNC for strong signals (3/3 confluence + strong volume + high confidence)
-  // MIS for weaker but tradeable signals
 
-  // Time window check
   const now = new Date();
   const mins = now.getHours() * 60 + now.getMinutes();
   const unsafe = CONFIG.UNSAFE_WINDOWS.find(w => {
@@ -273,12 +337,27 @@ function analyzeSignal(symbol, candles) {
   };
   const safeToTrade = Object.values(filtersPassed).every(Boolean);
 
-  // Position sizing
-  const stopDist = price * 0.015;  // 1.5% stop
-  const qty = Math.floor(CONFIG.RISK_PER_TRADE / stopDist);
+  // Position sizing — now balance-aware
+  const stopDist = price * 0.015;
   const entry = parseFloat(price.toFixed(2));
   const sl = parseFloat((price - stopDist).toFixed(2));
   const target = parseFloat((price + stopDist * CONFIG.REWARD_RATIO).toFixed(2));
+
+// Calculate qty based on available balance
+  const orderTypeForQty = (maxConfluence === 3 && volRatio > 1.5 && confidence > 60) ? "DELIVERY" : "INTRADAY";
+  const safeSizing = await calculateSafeQty(
+      price,
+      CONFIG.RISK_PER_TRADE,
+      state.angelAuth,
+      ENV.ANGEL_API_KEY,
+      orderTypeForQty
+  );
+  const qty = safeSizing.qty;
+
+// Log if qty was reduced
+  if (safeSizing.reduced) {
+    log(`⚠️ ${symbol}: ${safeSizing.reason}`);
+  }
 
   return {
     id: `${symbol}-${Date.now()}`,
@@ -294,14 +373,14 @@ function analyzeSignal(symbol, candles) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 6. TELEGRAM BOT — sends alerts with Execute/Skip buttons
+// 7. TELEGRAM BOT
 // ═══════════════════════════════════════════════════════════════════════════
 const tg = new TelegramBot(ENV.TELEGRAM_TOKEN, { polling: true });
 
 async function sendSignalAlert(sig) {
   state.pendingSignals.set(sig.id, sig);
-  // Auto-expire signal after 2 minutes
   setTimeout(() => state.pendingSignals.delete(sig.id), 120000);
+  await logSignal(sig, "pending");
 
   const emoji = sig.signal === "BUY" ? "🟢" : "🔴";
   const typeBadge = sig.orderType === "CNC" ? "📦 DELIVERY" : "⚡ INTRADAY";
@@ -315,12 +394,15 @@ async function sendSignalAlert(sig) {
 📦 Qty:    ${sig.qty} shares
 💸 Capital: ₹${sig.capital.toFixed(0)}
 
+💳 *Balance Status:*
+- Available: ₹${health.available.toLocaleString("en-IN")}
+- Exposure: ${health.exposurePct}%
+- Status: ${health.status} ${health.statusColor === "green" ? "✅" : health.statusColor === "orange" ? "⚠️" : "🔴"}
+
 📊 *Technicals:*
-• RSI: ${sig.indicators.rsi}
-• MACD: ${sig.indicators.checks.macd === "bull" ? "Bullish ✓" : "Bearish ✗"}
-• EMA Trend: ${sig.indicators.checks.ema}
-• Volume: ${sig.indicators.volRatio}x avg
-• Confluence: ${Math.max(sig.bullCount, sig.bearCount)}/3
+- RSI: ${sig.indicators.rsi}
+- MACD: ${sig.indicators.checks.macd === "bull" ? "Bullish ✓" : "Bearish ✗"}
+- Confluence: ${Math.max(sig.bullCount, sig.bearCount)}/3
 
 ⏰ _Signal expires in 2 minutes_`;
 
@@ -338,11 +420,10 @@ async function sendSignalAlert(sig) {
   });
 }
 
-// Handle button taps
 tg.on("callback_query", async (query) => {
-  const [action, mode, ...rest] = query.data.split("_");
-  const sigId = rest.join("_") || query.data.replace("skip_", "");
-  const sig = state.pendingSignals.get(sigId) || state.pendingSignals.get(sigId.replace("skip_", ""));
+  const data = query.data;
+  const sigId = data.replace(/^(exec_live_|exec_paper_|skip_)/, "");
+  const sig = state.pendingSignals.get(sigId);
 
   if (!sig) {
     await tg.answerCallbackQuery(query.id, { text: "⏰ Signal expired" });
@@ -353,44 +434,44 @@ tg.on("callback_query", async (query) => {
     return;
   }
 
-  if (query.data.startsWith("skip_")) {
+  if (data.startsWith("skip_")) {
     await tg.answerCallbackQuery(query.id, { text: "Skipped" });
     await tg.editMessageText(`❌ Skipped: ${sig.symbol} ${sig.signal}`, {
       chat_id: query.message.chat.id,
       message_id: query.message.message_id,
     });
     state.pendingSignals.delete(sig.id);
+    await logSignal(sig, "skipped");
     return;
   }
 
-  if (query.data.startsWith("exec_live_")) {
+  if (data.startsWith("exec_live_")) {
     if (!CONFIG.LIVE_TRADING) {
-      await tg.answerCallbackQuery(query.id, { text: "⚠️ Live trading disabled in config" });
+      await tg.answerCallbackQuery(query.id, { text: "⚠️ Live trading OFF in config" });
       return;
     }
     if (state.isHalted) {
-      await tg.answerCallbackQuery(query.id, { text: "🛑 Trading halted · loss limit hit" });
+      await tg.answerCallbackQuery(query.id, { text: "🛑 Trading halted" });
       return;
     }
     const activeLive = state.openTrades.filter(t => t.mode === "live" && t.status === "open").length;
     if (activeLive >= CONFIG.MAX_POSITIONS) {
-      await tg.answerCallbackQuery(query.id, { text: `Max ${CONFIG.MAX_POSITIONS} positions reached` });
+      await tg.answerCallbackQuery(query.id, { text: `Max ${CONFIG.MAX_POSITIONS} positions` });
       return;
     }
-
     await executeLiveOrder(sig);
     await tg.answerCallbackQuery(query.id, { text: "✅ Order placed" });
-    await tg.editMessageText(`✅ *EXECUTED LIVE* · ${sig.symbol}\n${sig.signal} @ ₹${sig.entry} · Qty ${sig.qty}\n_${sig.orderType} order placed · Trailing SL active_`, {
+    await tg.editMessageText(`✅ *EXECUTED LIVE* · ${sig.symbol}\n${sig.signal} @ ₹${sig.entry} · Qty ${sig.qty}\n_${sig.orderType} order · Trailing SL active_`, {
       chat_id: query.message.chat.id,
       message_id: query.message.message_id,
       parse_mode: "Markdown",
     });
   }
 
-  if (query.data.startsWith("exec_paper_")) {
+  if (data.startsWith("exec_paper_")) {
     executePaperTrade(sig);
     await tg.answerCallbackQuery(query.id, { text: "📝 Paper trade opened" });
-    await tg.editMessageText(`📝 *PAPER TRADE* · ${sig.symbol}\n${sig.signal} @ ₹${sig.entry} · Qty ${sig.qty}\n_Tracking virtually_`, {
+    await tg.editMessageText(`📝 *PAPER TRADE* · ${sig.symbol}\n${sig.signal} @ ₹${sig.entry} · Qty ${sig.qty}`, {
       chat_id: query.message.chat.id,
       message_id: query.message.message_id,
       parse_mode: "Markdown",
@@ -398,7 +479,21 @@ tg.on("callback_query", async (query) => {
   }
 });
 
-// Telegram commands
+// ═══ TELEGRAM COMMANDS ════════════════════════════════════════════════════
+tg.onText(/\/start/, async (msg) => {
+  await tg.sendMessage(msg.chat.id, `👋 *Welcome to NSE TradeAI Bot*
+
+Your intelligent trading assistant for NSE stocks.
+
+Commands:
+/status · current P&L and state
+/positions · open trades
+/stop · emergency kill switch
+/resume · restart trading
+
+Bot is ${CONFIG.LIVE_TRADING ? "LIVE ⚡" : "in PAPER mode 📝"}`, { parse_mode: "Markdown" });
+});
+
 tg.onText(/\/status/, async () => {
   const liveActive = state.openTrades.filter(t => t.mode === "live" && t.status === "open").length;
   const paperActive = state.openTrades.filter(t => t.mode === "paper" && t.status === "open").length;
@@ -409,18 +504,19 @@ Paper P&L today: ${state.dayPnL.paper >= 0 ? "+" : ""}₹${state.dayPnL.paper.to
 Live positions: ${liveActive}/${CONFIG.MAX_POSITIONS}
 Paper positions: ${paperActive}
 Live trading: ${CONFIG.LIVE_TRADING ? "✅ ON" : "❌ OFF"}
-Halted: ${state.isHalted ? "🛑 YES" : "✅ NO"}
-Total signals today: ${state.totalTrades.live + state.totalTrades.paper}`;
+Halted: ${state.isHalted ? "🛑 YES" : "✅ NO"}`;
   await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, msg, { parse_mode: "Markdown" });
 });
 
 tg.onText(/\/stop/, async () => {
   state.isHalted = true;
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "🛑 *KILL SWITCH ACTIVATED*\nAll new trades blocked. Active positions will continue with trailing SL.", { parse_mode: "Markdown" });
+  await logEvent("HALT", "Kill switch from Telegram");
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "🛑 *KILL SWITCH ACTIVATED*\nNew trades blocked.", { parse_mode: "Markdown" });
 });
 
 tg.onText(/\/resume/, async () => {
   state.isHalted = false;
+  await logEvent("RESUME", "Resume from Telegram");
   await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "✅ Trading resumed");
 });
 
@@ -434,19 +530,61 @@ tg.onText(/\/positions/, async () => {
 Entry: ₹${t.entry} · Now: ₹${curPrice.toFixed(2)}
 SL: ₹${t.currentSL} · Target: ₹${t.target}
 P&L: ${pnl >= 0 ? "+" : ""}₹${pnl.toFixed(0)}`;
-  }).join("\n━━━━━━━━━━━━━\n");
+  }).join("\n━━━━━━━━━━━\n");
   await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, msg, { parse_mode: "Markdown" });
 });
 
+tg.onText(/\/balance/, async () => {
+  const health = await getBalanceHealth(state.angelAuth, ENV.ANGEL_API_KEY);
+  const emoji = health.status === "HEALTHY" ? "✅" : health.status === "WARNING" ? "⚠️" : "🛑";
+
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `💰 *Balance Health*
+━━━━━━━━━━━━━
+${emoji} Status: ${health.status}
+
+Available Cash: ₹${health.available.toLocaleString("en-IN")}
+In Positions: ₹${health.utilised.toLocaleString("en-IN")}
+Total: ₹${health.total.toLocaleString("en-IN")}
+
+Exposure: ${health.exposurePct}%
+Safety Buffer: ₹${health.buffer.toLocaleString("en-IN")}
+Can Trade: ${health.canTrade ? "Yes ✅" : "No 🛑"}
+
+_${health.message}_`, { parse_mode: "Markdown" });
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
-// 7. ORDER EXECUTION
+// 8. ORDER EXECUTION
 // ═══════════════════════════════════════════════════════════════════════════
 async function executeLiveOrder(sig) {
+  // ═══ PRE-TRADE BALANCE CHECK ═══
+  const balanceCheck = await preTradeBalanceCheck(sig, state.angelAuth, ENV.ANGEL_API_KEY);
+
+  if (!balanceCheck.approved) {
+    log(`🚫 Trade blocked: ${sig.symbol} · ${balanceCheck.reason}`);
+    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
+        `🚫 *Trade Blocked*\n*${sig.symbol}* ${sig.signal}\nReason: ${balanceCheck.reason}\n${balanceCheck.message}`,
+        { parse_mode: "Markdown" }
+    );
+    return;
+  }
+
+  // If qty was reduced, update signal
+  if (balanceCheck.suggestedQty && balanceCheck.suggestedQty < sig.qty && balanceCheck.suggestedQty > 0) {
+    log(`📉 Reducing ${sig.symbol} qty: ${sig.qty} → ${balanceCheck.suggestedQty}`);
+    sig.qty = balanceCheck.suggestedQty;
+    sig.capital = sig.qty * sig.entry;
+    sig.maxLoss = sig.qty * (sig.entry - sig.sl);
+    sig.maxGain = sig.qty * (sig.target - sig.entry);
+  }
+
+  // ═══ PROCEED WITH ORDER ═══
   try {
+    const token = await getSymbolToken(sig.symbol);
     const orderPayload = {
       variety:         "NORMAL",
       tradingsymbol:   `${sig.symbol}-EQ`,
-      symboltoken:     await getSymbolToken(sig.symbol),
+      symboltoken:     token,
       transactiontype: sig.signal,
       exchange:        "NSE",
       ordertype:       "MARKET",
@@ -472,56 +610,45 @@ async function executeLiveOrder(sig) {
     if (res.data?.status) {
       const trade = {
         ...sig,
-        mode:       "live",
-        orderId:    res.data.data.orderid,
-        currentSL:  sig.sl,
+        mode:         "live",
+        orderId:      res.data.data.orderid,
+        currentSL:    sig.sl,
         currentPrice: sig.entry,
-        status:     "open",
-        openedAt:   new Date(),
-        trailed:    false,
+        status:       "open",
+        openedAt:     new Date(),
+        trailed:      false,
       };
       state.openTrades.push(trade);
       state.totalTrades.live++;
-      log(`✅ LIVE ORDER: ${sig.symbol} ${sig.signal} ${sig.qty} @ ₹${sig.entry} · OrderID: ${res.data.data.orderid}`);
+      await logTrade(trade);
+      await logSignal(sig, "executed_live");
+      log(`✅ LIVE: ${sig.symbol} ${sig.signal} ${sig.qty} @ ₹${sig.entry} · OrderID: ${res.data.data.orderid}`);
     }
   } catch (e) {
     log(`❌ Order failed: ${e.message}`);
-    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `⚠️ Order failed: ${sig.symbol}\nError: ${e.message}`);
+    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `⚠️ Order failed: ${sig.symbol}\n${e.message}`);
   }
 }
 
 function executePaperTrade(sig) {
-  state.openTrades.push({
+  const trade = {
     ...sig,
-    mode:       "paper",
-    currentSL:  sig.sl,
+    mode:         "paper",
+    currentSL:    sig.sl,
     currentPrice: sig.entry,
-    status:     "open",
-    openedAt:   new Date(),
-    trailed:    false,
-  });
+    status:       "open",
+    openedAt:     new Date(),
+    trailed:      false,
+  };
+  state.openTrades.push(trade);
   state.totalTrades.paper++;
+  logTrade(trade);
+  logSignal(sig, "executed_paper");
   log(`📝 PAPER: ${sig.symbol} ${sig.signal} ${sig.qty} @ ₹${sig.entry}`);
 }
 
-async function getSymbolToken(symbol) {
-  // Load from Angel One scrip master JSON (cached)
-  // Full list: https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json
-  const cachePath = "./scrip-master.json";
-  let master;
-  if (fs.existsSync(cachePath)) {
-    master = JSON.parse(fs.readFileSync(cachePath, "utf8"));
-  } else {
-    const res = await axios.get("https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json");
-    master = res.data;
-    fs.writeFileSync(cachePath, JSON.stringify(master));
-  }
-  const match = master.find(s => s.symbol === `${symbol}-EQ` && s.exch_seg === "NSE");
-  return match?.token || "";
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
-// 8. TRAILING STOP-LOSS ENGINE
+// 9. TRAILING STOP-LOSS ENGINE
 // ═══════════════════════════════════════════════════════════════════════════
 setInterval(async () => {
   for (const trade of state.openTrades.filter(t => t.status === "open")) {
@@ -529,42 +656,39 @@ setInterval(async () => {
     if (!curPrice) continue;
     trade.currentPrice = curPrice;
 
-    // Trail SL up
     const gainFromEntry = curPrice - trade.entry;
     if (gainFromEntry > 0) {
       const newSL = parseFloat((trade.sl + gainFromEntry).toFixed(2));
       if (newSL > trade.currentSL) {
+        await updateSLMovement(trade.id, trade.currentSL, newSL, curPrice);
         trade.currentSL = newSL;
         trade.trailed = true;
       }
     }
 
-    // Check SL hit
     if (curPrice <= trade.currentSL) {
       await closeTrade(trade, "SL_HIT", trade.currentSL);
-    }
-    // Check Target hit
-    else if (curPrice >= trade.target) {
+    } else if (curPrice >= trade.target) {
       await closeTrade(trade, "TARGET_HIT", trade.target);
-    }
-    // Auto-square MIS by 3:15 PM
-    else if (trade.orderType === "MIS" && new Date().getHours() === 15 && new Date().getMinutes() >= 15) {
-      await closeTrade(trade, "EOD_SQUARE_OFF", curPrice);
+    } else if (trade.orderType === "MIS") {
+      const now = new Date();
+      if (now.getHours() === 15 && now.getMinutes() >= 15) {
+        await closeTrade(trade, "EOD_SQUARE_OFF", curPrice);
+      }
     }
   }
 }, 3000);
 
 async function closeTrade(trade, reason, exitPrice) {
-  trade.status    = "closed";
+  trade.status = "closed";
   trade.exitPrice = exitPrice;
   trade.exitReason = reason;
-  trade.exitPnL   = (exitPrice - trade.entry) * trade.qty;
-  trade.closedAt  = new Date();
+  trade.exitPnL = (exitPrice - trade.entry) * trade.qty;
+  trade.closedAt = new Date();
 
-  // Update day P&L
   state.dayPnL[trade.mode] += trade.exitPnL;
+  await dbCloseTrade(trade.id, exitPrice, reason, trade.exitPnL);
 
-  // Live exit order
   if (trade.mode === "live" && CONFIG.LIVE_TRADING) {
     try {
       await axios.post(
@@ -580,14 +704,17 @@ async function closeTrade(trade, reason, exitPrice) {
           duration:        "DAY",
           quantity:        trade.qty.toString(),
         },
-        { headers: { "Authorization": `Bearer ${state.angelAuth}`, "Content-Type": "application/json", "X-PrivateKey": ENV.ANGEL_API_KEY } }
+        { headers: {
+          "Authorization": `Bearer ${state.angelAuth}`,
+          "Content-Type": "application/json",
+          "X-PrivateKey": ENV.ANGEL_API_KEY
+        }}
       );
     } catch (e) {
       log(`❌ Exit order failed: ${e.message}`);
     }
   }
 
-  // Telegram alert
   const emoji = reason === "TARGET_HIT" ? "🎯" : reason === "SL_HIT" ? "🛑" : "⏰";
   const pnlEmoji = trade.exitPnL >= 0 ? "✅" : "❌";
   await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `${emoji} *${reason.replace("_", " ")}* · ${trade.mode === "live" ? "💰 LIVE" : "📝 PAPER"}
@@ -598,20 +725,19 @@ Day ${trade.mode} total: ₹${state.dayPnL[trade.mode].toFixed(0)}`, { parse_mod
 
   log(`${reason}: ${trade.symbol} · P&L: ₹${trade.exitPnL.toFixed(0)}`);
 
-  // Daily loss cap check
   if (state.dayPnL.live <= -CONFIG.DAILY_LOSS_CAP && !state.isHalted) {
     state.isHalted = true;
-    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🛑 *DAILY LOSS CAP HIT*\nLive loss: ₹${state.dayPnL.live.toFixed(0)}\nAll new trades blocked for today. Use /resume tomorrow.`, { parse_mode: "Markdown" });
+    await logEvent("LOSS_CAP_HIT", `Day loss: ₹${state.dayPnL.live.toFixed(0)}`);
+    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🛑 *DAILY LOSS CAP HIT*\nLive loss: ₹${state.dayPnL.live.toFixed(0)}\nAll new trades blocked.\nUse /resume tomorrow.`, { parse_mode: "Markdown" });
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 9. MAIN LOOP — scan watchlist every 60 seconds
+// 10. MAIN SIGNAL SCANNER
 // ═══════════════════════════════════════════════════════════════════════════
 setInterval(async () => {
   const now = new Date();
   const mins = now.getHours() * 60 + now.getMinutes();
-  // Only during market hours (9:15 AM – 3:30 PM)
   if (mins < 555 || mins > 930) return;
   if (state.isHalted) return;
 
@@ -619,26 +745,19 @@ setInterval(async () => {
     const candles = state.candleBuffer.get(symbol);
     if (!candles || candles.length < 50) continue;
 
-    // Skip if already in trade for this symbol
     if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) continue;
 
-    const sig = analyzeSignal(symbol, candles);
+    const sig = await  analyzeSignal(symbol, candles);
     if (!sig || sig.signal === "HOLD") continue;
     if (!sig.safeToTrade) continue;
 
-    // Always send to Telegram — user decides live vs paper vs skip
     await sendSignalAlert(sig);
   }
 }, 60000);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 10. LOGGING & STARTUP
+// 11. STARTUP
 // ═══════════════════════════════════════════════════════════════════════════
-function log(msg) {
-  const ts = new Date().toISOString().replace("T", " ").substring(0, 19);
-  console.log(`[${ts}] ${msg}`);
-}
-
 async function startup() {
   log("🚀 NSE TradeAI Bot v4 starting...");
   log(`   Capital:      ₹${CONFIG.CAPITAL.toLocaleString("en-IN")}`);
@@ -646,10 +765,25 @@ async function startup() {
   log(`   Live trading: ${CONFIG.LIVE_TRADING ? "✅ ENABLED" : "❌ DISABLED (paper only)"}`);
   log(`   Watchlist:    ${CONFIG.WATCHLIST.length} stocks`);
 
-  const authOk = await authenticateAngel();
-  if (!authOk) { log("❌ Cannot start without Angel One auth"); process.exit(1); }
+  // 1. Database
+  await initDB();
+  await logEvent("STARTUP", "Bot started");
 
-  // Resolve tokens for watchlist
+  // 2. Start API server (capture app + auth)
+  const { app, auth } = startAPI(3000);
+
+  // 3. Register Angel One account endpoints
+  addAccountEndpoints(app, state, auth);
+  log("✅ Account endpoints registered");
+
+  // 4. Authenticate Angel One
+  const authOk = await authenticateAngel();
+  if (!authOk) {
+    log("❌ Cannot start without Angel One auth");
+    process.exit(1);
+  }
+
+  // 5. Resolve symbol tokens
   const tokens = [];
   for (const sym of CONFIG.WATCHLIST) {
     const t = await getSymbolToken(sym);
@@ -657,12 +791,14 @@ async function startup() {
   }
   log(`✓ Resolved ${tokens.length} symbol tokens`);
 
+  // 6. Start WebSocket
   await startWebSocket(tokens);
 
+  // 7. Notify Telegram
   await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🚀 *NSE TradeAI Bot Online*
 ━━━━━━━━━━━━━━━━
 Capital: ₹2,50,000
-Risk: ₹1,000/trade (will scale after 2 weeks)
+Risk: ₹1,000/trade
 Live: ${CONFIG.LIVE_TRADING ? "ON ⚡" : "OFF (paper only)"}
 Watchlist: ${CONFIG.WATCHLIST.length} stocks
 
@@ -672,12 +808,24 @@ Commands:
   log("✅ Bot fully operational");
 }
 
-startup().catch(e => { log(`💥 Fatal: ${e.message}`); process.exit(1); });
+startup().catch(e => {
+  log(`💥 Fatal: ${e.message}`);
+  console.error(e);
+  process.exit(1);
+});
 
-// Graceful shutdown
+// ═══════════════════════════════════════════════════════════════════════════
+// 12. GRACEFUL SHUTDOWN
+// ═══════════════════════════════════════════════════════════════════════════
 process.on("SIGINT", async () => {
   log("Shutting down...");
+  await logEvent("SHUTDOWN", "Graceful shutdown");
   await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "⚠️ Bot shutting down");
   if (state.ws) state.ws.close();
   process.exit(0);
+});
+
+process.on("uncaughtException", async (err) => {
+  log(`💥 Uncaught: ${err.message}`);
+  await logEvent("ERROR", err.message, { stack: err.stack });
 });
