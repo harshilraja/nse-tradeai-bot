@@ -14,6 +14,8 @@ import {
   updateSLMovement, logEvent, startAPI
 } from "./db-api.js";
 import { addAccountEndpoints } from "./angel-account-api.js";
+import { addBacktestEndpoints } from "./backtest-api.js";
+import { addBalanceEndpoints, smartBalanceCheck } from "./balance-optimized.js";
 
 dotenv.config();
 
@@ -629,6 +631,22 @@ tg.onText(/\/testhist/, async () => {
 
 async function executeLiveOrder(sig) {
   try {
+    const check = await smartBalanceCheck(sig, state.angelAuth, ENV.ANGEL_API_KEY);
+
+    if (!check.approved) {
+      await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
+          `🚫 *Trade Blocked*\n${sig.symbol}\n${check.message}`,
+          { parse_mode: "Markdown" });
+      return;
+    }
+
+    // If qty was adjusted, update signal
+    if (check.adjusted) {
+      sig.qty = check.suggestedQty;
+      await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
+          `📉 Qty adjusted: ${check.originalQty} → ${check.suggestedQty}\n${check.message}`);
+    }
+    
     const token = await getSymbolToken(sig.symbol);
     const res = await axios.post(
         "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
@@ -781,6 +799,8 @@ async function startup() {
 
   const { app, auth } = startAPI(3000);
   addAccountEndpoints(app, state, auth);
+  addBacktestEndpoints(app, state, auth);
+  addBalanceEndpoints(app, state, auth);
 
   const authOk = await authenticateAngel();
   if (!authOk) process.exit(1);
