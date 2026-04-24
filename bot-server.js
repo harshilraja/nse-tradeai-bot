@@ -245,7 +245,10 @@ async function getSymbolToken(symbol) {
 async function loadHistoricalCandles(symbol) {
   try {
     const token = await getSymbolToken(symbol);
-    if (!token) return 0;
+    if (!token) {
+      log(`❌ Skip ${symbol}: token not found`);
+      return 0;
+    }
 
     const now = new Date();
     const fromDate = new Date(now.getTime() - 5 * 24 * 60 * 60 * 1000);
@@ -689,6 +692,10 @@ tg.onText(/\/positions/, async () => {
 async function executeLiveOrder(sig) {
   try {
     const token = await getSymbolToken(sig.symbol);
+    if (!token) {
+      log(`❌ Skip ${symbol}: token not found`);
+      return 0;
+    }
     const res = await axios.post(
         "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
         {
