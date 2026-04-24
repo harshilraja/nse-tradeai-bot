@@ -3,7 +3,7 @@
   "version": "4.0.0",
   "type": "module",
   "description": "Semi-auto NSE trading bot with Angel One + Telegram",
-  "main": "bot-server.js",
+  "main": "bot-server-old.js",
   "scripts": {
     "start": "node bot-server.js"
   },
