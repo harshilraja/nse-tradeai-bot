@@ -803,7 +803,7 @@ Live: ${CONFIG.LIVE_TRADING ? "ON ⚡" : "OFF (paper only)"}
 Watchlist: ${CONFIG.WATCHLIST.length} stocks
 
 Commands:
-/status · /positions · /stop · /resume`, { parse_mode: "Markdown" });
+/status · /positions · /stop · /resume · /balance` , { parse_mode: "Markdown" });
 
   log("✅ Bot fully operational");
 }
