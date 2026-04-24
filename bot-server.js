@@ -283,7 +283,7 @@ function macd(closes) {
 // ═══════════════════════════════════════════════════════════════════════════
 // 6. STRATEGY ENGINE
 // ═══════════════════════════════════════════════════════════════════════════
-function analyzeSignal(symbol, candles) {
+async function analyzeSignal(symbol, candles) {
   if (candles.length < 50) return null;
   const closes = candles.map(c => c.c);
   const vols   = candles.map(c => c.v);
