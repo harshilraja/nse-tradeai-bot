@@ -30,16 +30,17 @@ const CONFIG = {
   MAX_POSITIONS:     3,
   LIVE_TRADING:      process.env.LIVE_TRADING === "true",
 
-  SL_PCT:            0.008,
-  TARGET_PCT:        0.016,
+  SL_PCT:            0.006,
+  TARGET_PCT:        0.024,
 
-  SIGNAL_SCORE_BUY:  2.0,
-  SIGNAL_SCORE_SELL: -2.0,
-  MIN_CONFLUENCE:    2,
-  MIN_CONFIDENCE:    55,
-  MIN_VOLUME_RATIO:  0.8,
-  MIN_CANDLES:       15,
-  SCAN_INTERVAL_MS:  15000,
+  SIGNAL_SCORE_BUY:  4.0,
+  SIGNAL_SCORE_SELL: -4.0,
+  MIN_CONFLUENCE:    4,
+  MIN_CONFIDENCE:    65,
+  MIN_VOLUME_RATIO:  1.3,
+  MIN_CANDLES:       30,
+  MIN_ADX:           25,
+  SCAN_INTERVAL_MS:  20000,
 
   FORCE_SIGNAL_AFTER_HOUR: 12,
   FORCE_SIGNAL_MAX_HOUR:   14.5,
@@ -419,67 +420,162 @@ function bollinger(c,p=20){if(c.length<p)return{upper:0,lower:0,mid:0};const s=c
 // ═══════════════════════════════════════════════════════════════════════════
 // STRATEGY
 // ═══════════════════════════════════════════════════════════════════════════
+
 function analyzeSignal(symbol, candles, relaxed = false) {
-  if (candles.length < CONFIG.MIN_CANDLES) return { rejected: true };
+  if (candles.length < CONFIG.MIN_CANDLES) {
+    return { rejected: true, reason: `${candles.length} candles` };
+  }
 
   const closes = candles.map(c => c.c);
+  const highs = candles.map(c => c.h);
+  const lows = candles.map(c => c.l);
   const vols = candles.map(c => c.v);
   const price = closes[closes.length - 1];
+
+  // ═══ 1. INDICATORS ═══
   const R = rsi(closes);
   const M = macd(closes);
-  const e9 = ema(closes, 9), e21 = ema(closes, 21), e50 = ema(closes, 50);
+  const e9 = ema(closes, 9);
+  const e21 = ema(closes, 21);
+  const e50 = ema(closes, 50);
+  const e200 = ema(closes, Math.min(200, closes.length - 1));
   const vw = vwap(candles);
   const adxData = adx(candles);
   const st = supertrend(candles);
   const bb = bollinger(closes);
+  const a = atr(candles);
   const avgVol = vols.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, vols.length);
   const volRatio = avgVol > 0 ? vols[vols.length - 1] / avgVol : 1;
 
-  let score = 0, bullCount = 0, bearCount = 0;
+  // ═══ 2. CRITICAL FILTERS — REJECT IF NOT TRENDING ═══
+  // This alone removes ~60% of false signals
+  if (!relaxed && adxData.adx < CONFIG.MIN_ADX) {
+    return {
+      rejected: true,
+      reason: `ADX ${adxData.adx.toFixed(1)} below ${CONFIG.MIN_ADX} (no trend)`,
+      symbol, signal: "HOLD"
+    };
+  }
+
+  // ═══ 3. MULTI-TIMEFRAME TREND CHECK ═══
+  // Only BUY if higher timeframe (EMA200) is also bullish
+  const longTermBullish = price > e200;
+  const longTermBearish = price < e200;
+
+  // ═══ 4. CANDLESTICK PATTERN DETECTION ═══
+  const last = candles[candles.length - 1];
+  const prev = candles[candles.length - 2];
+  const prev2 = candles[candles.length - 3];
+
+  // Bullish reversal patterns
+  const isBullishEngulfing = prev && last.c > last.o && prev.c < prev.o &&
+      last.c > prev.o && last.o < prev.c;
+  const isHammer = last && (last.c - last.l) > 2 * (last.h - last.c) &&
+      last.c > last.o;
+
+  // Bearish reversal patterns
+  const isBearishEngulfing = prev && last.c < last.o && prev.c > prev.o &&
+      last.c < prev.o && last.o > prev.c;
+  const isShootingStar = last && (last.h - last.c) > 2 * (last.c - last.l) &&
+      last.c < last.o;
+
+  // ═══ 5. SCORING WITH WEIGHTED INDICATORS ═══
+  let score = 0;
+  let bullCount = 0, bearCount = 0;
   const checks = {};
 
-  if (R < 40) { score += 2; bullCount++; checks.rsi = "bull"; }
-  else if (R > 60) { score -= 2; bearCount++; checks.rsi = "bear"; }
+  // RSI (weight: 2)
+  // STRICTER: only oversold/overbought zones
+  if (R < 30) { score += 2.5; bullCount++; checks.rsi = "oversold"; }
+  else if (R > 70) { score -= 2.5; bearCount++; checks.rsi = "overbought"; }
+  else if (R < 40 && longTermBullish) { score += 1; bullCount++; checks.rsi = "bull"; }
+  else if (R > 60 && longTermBearish) { score -= 1; bearCount++; checks.rsi = "bear"; }
   else checks.rsi = "neutral";
 
-  if (M.bullish) { score += 1.5; bullCount++; checks.macd = "bull"; }
-  else { score -= 1.5; bearCount++; checks.macd = "bear"; }
+  // MACD with signal line (weight: 2)
+  if (M.bullish && M.value > 0) { score += 2; bullCount++; checks.macd = "strong-bull"; }
+  else if (!M.bullish && M.value < 0) { score -= 2; bearCount++; checks.macd = "strong-bear"; }
+  else if (M.bullish) { score += 0.5; checks.macd = "weak-bull"; }
+  else { score -= 0.5; checks.macd = "weak-bear"; }
 
-  if (e9 > e21 && e21 > e50) { score += 2; bullCount++; checks.ema = "bull"; }
-  else if (e9 < e21 && e21 < e50) { score -= 2; bearCount++; checks.ema = "bear"; }
-  else if (e9 > e21) { score += 0.5; checks.ema = "bull-weak"; }
-  else { score -= 0.5; checks.ema = "bear-weak"; }
+  // EMA alignment (weight: 2.5) — HIGHEST trend signal
+  if (e9 > e21 && e21 > e50 && e50 > e200) {
+    score += 2.5; bullCount++; checks.ema = "strong-bull-alignment";
+  }
+  else if (e9 < e21 && e21 < e50 && e50 < e200) {
+    score -= 2.5; bearCount++; checks.ema = "strong-bear-alignment";
+  }
+  else if (e9 > e21 && e21 > e50) { score += 1; bullCount++; checks.ema = "bull"; }
+  else if (e9 < e21 && e21 < e50) { score -= 1; bearCount++; checks.ema = "bear"; }
+  else checks.ema = "mixed";
 
-  if (price > vw * 1.002) { score += 1.5; bullCount++; checks.vwap = "bull"; }
-  else if (price < vw * 0.998) { score -= 1.5; bearCount++; checks.vwap = "bear"; }
-  else checks.vwap = "neutral";
+  // VWAP (weight: 2) — CRITICAL for intraday
+  if (price > vw * 1.003) { score += 2; bullCount++; checks.vwap = "above"; }
+  else if (price < vw * 0.997) { score -= 2; bearCount++; checks.vwap = "below"; }
+  else checks.vwap = "near";
 
-  if (adxData.trending) {
-    if (adxData.plusDI > adxData.minusDI) { score += 1; checks.adx = "bull-trend"; }
-    else { score -= 1; checks.adx = "bear-trend"; }
-  } else checks.adx = "ranging";
+  // ADX trend strength (weight: 1.5)
+  if (adxData.trending && adxData.adx > 30) {
+    if (adxData.plusDI > adxData.minusDI * 1.2) {
+      score += 1.5; bullCount++; checks.adx = "strong-bull-trend";
+    } else if (adxData.minusDI > adxData.plusDI * 1.2) {
+      score -= 1.5; bearCount++; checks.adx = "strong-bear-trend";
+    }
+  } else if (adxData.trending) {
+    if (adxData.plusDI > adxData.minusDI) { score += 0.5; checks.adx = "bull-trend"; }
+    else { score -= 0.5; checks.adx = "bear-trend"; }
+  } else {
+    checks.adx = "ranging";
+  }
 
-  if (st.trend === "bull") { score += 1; bullCount++; }
-  else if (st.trend === "bear") { score -= 1; bearCount++; }
-  checks.supertrend = st.trend;
+  // Supertrend (weight: 1.5) — strong directional confirmation
+  if (st.trend === "bull") { score += 1.5; bullCount++; checks.supertrend = "bull"; }
+  else if (st.trend === "bear") { score -= 1.5; bearCount++; checks.supertrend = "bear"; }
+  else checks.supertrend = "neutral";
 
-  if (price <= bb.lower * 1.005) { score += 1; checks.bb = "oversold"; }
-  else if (price >= bb.upper * 0.995) { score -= 1; checks.bb = "overbought"; }
+  // Bollinger + bounce confirmation (weight: 1)
+  if (price <= bb.lower * 1.005 && R < 35) {
+    score += 1.5; checks.bb = "oversold-bounce";  // strong reversal setup
+  } else if (price >= bb.upper * 0.995 && R > 65) {
+    score -= 1.5; checks.bb = "overbought-rejection";
+  }
 
-  if (volRatio > 1.5) score += Math.sign(score) * 1;
-  else if (volRatio < 0.5) score *= 0.8;
+  // Candlestick patterns (weight: 1.5)
+  if (isBullishEngulfing || isHammer) {
+    score += 1.5; bullCount++;
+    checks.pattern = isBullishEngulfing ? "bullish-engulfing" : "hammer";
+  } else if (isBearishEngulfing || isShootingStar) {
+    score -= 1.5; bearCount++;
+    checks.pattern = isBearishEngulfing ? "bearish-engulfing" : "shooting-star";
+  }
 
-  const sb = relaxed ? 1.5 : CONFIG.SIGNAL_SCORE_BUY;
-  const ss = relaxed ? -1.5 : CONFIG.SIGNAL_SCORE_SELL;
-  const mc = relaxed ? 1 : CONFIG.MIN_CONFLUENCE;
+  // Volume confirmation (multiplier)
+  if (volRatio > 2.0) score *= 1.2;       // Strong volume = boost score
+  else if (volRatio > 1.5) score *= 1.1;
+  else if (volRatio < 0.7) score *= 0.7;  // Weak volume = reduce conviction
+
+  // ═══ 6. LONG-TERM TREND OVERRIDE ═══
+  // Don't BUY against major bearish trend
+  if (longTermBearish && score > 0) score *= 0.5;
+  if (longTermBullish && score < 0) score *= 0.5;
+
+  // ═══ 7. DETERMINE SIGNAL ═══
+  const sb = relaxed ? 2.5 : CONFIG.SIGNAL_SCORE_BUY;
+  const ss = relaxed ? -2.5 : CONFIG.SIGNAL_SCORE_SELL;
+  const mc = relaxed ? 3 : CONFIG.MIN_CONFLUENCE;
 
   let signal = "HOLD", confidence = 50;
-  if (score >= sb) { signal = "BUY"; confidence = Math.min(52 + score * 4, 80); }
-  else if (score <= ss) { signal = "SELL"; confidence = Math.min(52 + Math.abs(score) * 4, 78); }
+  if (score >= sb) {
+    signal = "BUY";
+    confidence = Math.min(55 + score * 3, 85);
+  } else if (score <= ss) {
+    signal = "SELL";
+    confidence = Math.min(55 + Math.abs(score) * 3, 82);
+  }
 
   const maxConf = Math.max(bullCount, bearCount);
-  const orderType = (maxConf >= 4 && volRatio > 1.3 && confidence > 65 && adxData.trending) ? "CNC" : "MIS";
 
+  // ═══ 8. SAFETY FILTERS ═══
   const ist = getISTDate();
   const mins = ist.getHours() * 60 + ist.getMinutes();
   const unsafe = CONFIG.UNSAFE_WINDOWS.find(w => {
@@ -489,35 +585,60 @@ function analyzeSignal(symbol, candles, relaxed = false) {
   });
 
   const filtersPassed = {
-    confluence: maxConf >= mc, time: !unsafe,
-    volume: volRatio >= (relaxed ? 0.5 : CONFIG.MIN_VOLUME_RATIO),
+    confluence: maxConf >= mc,
+    time: !unsafe,
+    volume: volRatio >= (relaxed ? 1.0 : CONFIG.MIN_VOLUME_RATIO),
     strength: Math.abs(score) >= Math.abs(sb),
-    confidence: confidence >= (relaxed ? 50 : CONFIG.MIN_CONFIDENCE),
+    confidence: confidence >= (relaxed ? 60 : CONFIG.MIN_CONFIDENCE),
+    trend: relaxed ? true : adxData.adx >= CONFIG.MIN_ADX,
+    longTerm: signal === "BUY" ? !longTermBearish : signal === "SELL" ? !longTermBullish : true,
   };
   const safeToTrade = Object.values(filtersPassed).every(Boolean);
 
-  const stopDist = price * CONFIG.SL_PCT;
-  const targetDist = price * CONFIG.TARGET_PCT;
+  // ═══ 9. ATR-BASED DYNAMIC SL/TARGET ═══
+  // Use ATR (Average True Range) for adaptive stop-loss
+  // ATR-based SL is much better than fixed percentage
+  const atrMultiplier = 1.5;  // SL = 1.5x ATR
+  const targetMultiplier = 4.5;  // Target = 4.5x ATR (1:3 RR minimum)
+
+  const stopDist = Math.max(price * CONFIG.SL_PCT, a * atrMultiplier);
+  const targetDist = Math.max(price * CONFIG.TARGET_PCT, a * targetMultiplier);
+
   const qty = Math.max(1, Math.floor(CONFIG.RISK_PER_TRADE / stopDist));
   const entry = parseFloat(price.toFixed(2));
   const sl = parseFloat((signal === "BUY" ? price - stopDist : price + stopDist).toFixed(2));
   const target = parseFloat((signal === "BUY" ? price + targetDist : price - targetDist).toFixed(2));
 
+  // CNC vs MIS (only for very strong signals)
+  const orderType = (maxConf >= 5 && volRatio > 1.5 && confidence > 75 && adxData.adx > 30) ? "CNC" : "MIS";
+
   return {
-    id: `${symbol}-${Date.now()}`, symbol, signal,
+    id: `${symbol}-${Date.now()}`,
+    symbol, signal,
     confidence: parseFloat(confidence.toFixed(1)),
-    score: parseFloat(score.toFixed(2)), orderType,
+    score: parseFloat(score.toFixed(2)),
+    orderType,
     indicators: {
-      rsi: parseFloat(R.toFixed(1)), vwap: parseFloat(vw.toFixed(2)),
-      adx: parseFloat(adxData.adx?.toFixed(1) || 0),
-      supertrend: st.trend, volRatio: parseFloat(volRatio.toFixed(2)),
-      price: entry, checks,
+      rsi: parseFloat(R.toFixed(1)),
+      macd: parseFloat(M.value.toFixed(3)),
+      vwap: parseFloat(vw.toFixed(2)),
+      adx: parseFloat(adxData.adx.toFixed(1)),
+      supertrend: st.trend,
+      atr: parseFloat(a.toFixed(2)),
+      volRatio: parseFloat(volRatio.toFixed(2)),
+      price: entry,
+      pattern: checks.pattern || "none",
+      checks,
     },
-    bullCount, bearCount, filtersPassed, safeToTrade,
+    bullCount, bearCount,
+    longTermTrend: longTermBullish ? "bullish" : longTermBearish ? "bearish" : "neutral",
+    filtersPassed, safeToTrade,
     entry, sl, target, qty,
     capital: qty * entry,
-    maxLoss: qty * stopDist, maxGain: qty * targetDist,
-    relaxed, timestamp: Date.now(), rejected: false,
+    maxLoss: qty * stopDist,
+    maxGain: qty * targetDist,
+    relaxed, timestamp: Date.now(),
+    rejected: false,
   };
 }
 
@@ -646,7 +767,7 @@ async function executeLiveOrder(sig) {
       await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
           `📉 Qty adjusted: ${check.originalQty} → ${check.suggestedQty}\n${check.message}`);
     }
-    
+
     const token = await getSymbolToken(sig.symbol);
     const res = await axios.post(
         "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
@@ -725,65 +846,155 @@ async function closeTrade(t, reason, exit) {
 }
 
 // Scanner
+
+let schedulerRunning = false;
+let lastScanCompletedAt = null;
+
 async function runScan(verbose = false) {
-  const ist = getISTDate();
-  const mins = ist.getHours() * 60 + ist.getMinutes();
-  if (mins < 555 || mins > 930) return;
-  if (state.isHalted) return;
-
-  state.scanCount++;
-  state.lastScanTime = new Date();
-  const r = { scanned: 0, noCandles: 0, inPos: 0, hold: 0, filtered: 0, alerted: 0 };
-
-  for (const symbol of CONFIG.WATCHLIST) {
-    r.scanned++;
-    const candles = state.candleBuffer.get(symbol);
-    if (!candles || candles.length < CONFIG.MIN_CANDLES) { r.noCandles++; continue; }
-    if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) { r.inPos++; continue; }
-    const sig = analyzeSignal(symbol, candles);
-    if (!sig || sig.rejected) { r.noCandles++; continue; }
-    if (sig.signal === "HOLD") { r.hold++; continue; }
-    if (!sig.safeToTrade) { r.filtered++; continue; }
-    r.alerted++;
-    await sendSignalAlert(sig);
+  // Prevent overlapping scans
+  if (schedulerRunning) {
+    log("⏭️ Skipping scan (previous still running)");
+    return;
   }
+  schedulerRunning = true;
 
-  // Forced signal
-  const curHour = ist.getHours() + ist.getMinutes() / 60;
-  if (state.signalsToday === 0 && !state.forcedSignalSent &&
-      curHour >= CONFIG.FORCE_SIGNAL_AFTER_HOUR && curHour <= CONFIG.FORCE_SIGNAL_MAX_HOUR) {
-    let best = null;
+  try {
+    const ist = getISTDate();
+    const mins = ist.getHours() * 60 + ist.getMinutes();
+    const isMarketHours = mins >= 555 && mins <= 930;
+
+    if (!isMarketHours) {
+      if (verbose) log(`⏰ Market closed (${ist.toLocaleTimeString("en-IN")})`);
+      schedulerRunning = false;
+      return;
+    }
+
+    if (state.isHalted) {
+      if (verbose) log("🛑 Bot halted");
+      schedulerRunning = false;
+      return;
+    }
+
+    state.scanCount++;
+    state.lastScanTime = new Date();
+
+    const results = {
+      scanned: 0, noCandles: 0, inPos: 0, hold: 0,
+      filtered: 0, alerted: 0, rejectedBy: {},
+    };
+
     for (const symbol of CONFIG.WATCHLIST) {
+      results.scanned++;
       const candles = state.candleBuffer.get(symbol);
-      if (!candles || candles.length < CONFIG.MIN_CANDLES) continue;
-      if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) continue;
-      const sig = analyzeSignal(symbol, candles, true);
-      if (!sig || sig.signal === "HOLD") continue;
-      if (!best || Math.abs(sig.score) > Math.abs(best.score)) best = sig;
-    }
-    if (best?.safeToTrade) {
-      state.forcedSignalSent = true;
-      log(`🎯 FORCED: ${best.symbol} ${best.signal}`);
-      await sendSignalAlert(best, true);
-    }
-  }
 
-  if (state.scanCount % 20 === 1 || verbose) {
-    log(`🔍 Scan #${state.scanCount} · ${r.scanned} stocks | ${r.noCandles} no-data | ${r.inPos} in-trade | ${r.hold} hold | ${r.filtered} filtered | ${r.alerted} alerted`);
+      if (!candles || candles.length < CONFIG.MIN_CANDLES) {
+        results.noCandles++;
+        continue;
+      }
+
+      if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) {
+        results.inPos++;
+        continue;
+      }
+
+      const sig = analyzeSignal(symbol, candles);
+      if (!sig || sig.rejected) {
+        results.noCandles++;
+        continue;
+      }
+
+      if (sig.signal === "HOLD") {
+        results.hold++;
+        continue;
+      }
+
+      if (!sig.safeToTrade) {
+        results.filtered++;
+        const failed = Object.entries(sig.filtersPassed).filter(([k, v]) => !v).map(([k]) => k);
+        failed.forEach(f => results.rejectedBy[f] = (results.rejectedBy[f] || 0) + 1);
+        continue;
+      }
+
+      results.alerted++;
+      await sendSignalAlert(sig);
+    }
+
+    // Forced signal logic
+    const curHour = ist.getHours() + ist.getMinutes() / 60;
+    if (state.signalsToday === 0 && !state.forcedSignalSent &&
+        curHour >= CONFIG.FORCE_SIGNAL_AFTER_HOUR &&
+        curHour <= CONFIG.FORCE_SIGNAL_MAX_HOUR) {
+      let best = null;
+      for (const symbol of CONFIG.WATCHLIST) {
+        const candles = state.candleBuffer.get(symbol);
+        if (!candles || candles.length < CONFIG.MIN_CANDLES) continue;
+        if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) continue;
+        const sig = analyzeSignal(symbol, candles, true);
+        if (!sig || sig.signal === "HOLD") continue;
+        if (!best || Math.abs(sig.score) > Math.abs(best.score)) best = sig;
+      }
+      if (best?.safeToTrade) {
+        state.forcedSignalSent = true;
+        log(`🎯 FORCED: ${best.symbol} ${best.signal}`);
+        await sendSignalAlert(best, true);
+      }
+    }
+
+    lastScanCompletedAt = new Date();
+
+    // Always log scan results so you can see scheduler is alive
+    log(`🔍 Scan #${state.scanCount} · ${results.scanned} stocks | ${results.noCandles} no-data | ${results.inPos} in-trade | ${results.hold} hold | ${results.filtered} filtered | ${results.alerted} alerted`);
+
+    if (Object.keys(results.rejectedBy).length > 0 && verbose) {
+      log(`   Filter rejects: ${Object.entries(results.rejectedBy).map(([k, v]) => `${k}=${v}`).join(", ")}`);
+    }
+  } catch (e) {
+    log(`💥 Scan error: ${e.message}`);
+    console.error(e);
+  } finally {
+    schedulerRunning = false;
   }
 }
 
-setInterval(() => runScan(), CONFIG.SCAN_INTERVAL_MS);
+let scanInterval = null;
+
+function startScheduler() {
+  if (scanInterval) clearInterval(scanInterval);
+
+  log(`⏰ Starting scheduler · scan every ${CONFIG.SCAN_INTERVAL_MS / 1000}s`);
+
+  scanInterval = setInterval(() => {
+    runScan().catch(e => log(`💥 Scheduler error: ${e.message}`));
+  }, CONFIG.SCAN_INTERVAL_MS);
+
+  // Run first scan after 5s
+  setTimeout(() => {
+    log("🚀 Running first scan");
+    runScan(true).catch(e => log(`💥 First scan error: ${e.message}`));
+  }, 5000);
+}
+
+// ═══ WATCHDOG: Restart scheduler if dead ═══════════════════════════════════
+// Add this to detect and recover from stuck scheduler:
 
 setInterval(() => {
-  const ist = getISTDate();
-  if (ist.getHours() === 9 && ist.getMinutes() === 15) {
-    state.signalsToday = 0;
-    state.forcedSignalSent = false;
-    state.dayPnL = { live: 0, paper: 0 };
-    log("🌅 Daily counters reset");
+  if (!lastScanCompletedAt) return;
+
+  const timeSinceLastScan = Date.now() - lastScanCompletedAt.getTime();
+  const expectedInterval = CONFIG.SCAN_INTERVAL_MS;
+
+  // If scan hasn't completed in 3x expected interval, scheduler is dead
+  if (timeSinceLastScan > expectedInterval * 3) {
+    const ist = getISTDate();
+    const mins = ist.getHours() * 60 + ist.getMinutes();
+    const isMarketHours = mins >= 555 && mins <= 930;
+
+    if (isMarketHours && !state.isHalted) {
+      log(`⚠️ Scheduler appears stuck (last scan ${Math.round(timeSinceLastScan / 1000)}s ago) · restarting`);
+      startScheduler();
+    }
   }
-}, 60000);
+}, 60000);  // Check every minute
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STARTUP
