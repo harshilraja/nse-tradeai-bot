@@ -1,6 +1,6 @@
 {
   "name": "nse-tradeai-bot",
-  "version": "4.0.0",
+  "version": "6.4.0",
   "type": "module",
   "description": "Semi-auto NSE trading bot with Angel One + Telegram",
   "main": "bot-server-old.js",

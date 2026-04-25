@@ -1,6 +1,15 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// NSE TradeAI Bot v6.2 · ALL CRITICAL FIXES APPLIED
-// Fixes: IST timezone · historical API headers · weekend dates · retries
+// NSE TradeAI Bot v6.4 · COMPLETE FINAL VERSION
+// 
+// ALL FEATURES:
+// ✅ Strict 9 AM - 4 PM IST scheduler with watchdog
+// ✅ Bulletproof scrip master (3 retries + multiple URLs + hardcoded fallback)
+// ✅ v6.3 high-accuracy strategy (ATR-SL, ADX filter, EMA200, patterns)
+// ✅ Claude AI sentiment layer (validates signals via news/context)
+// ✅ Statistical learning (boosts confidence based on real outcomes)
+// ✅ On-demand scan from mobile + Telegram /scan
+// ✅ Balance-aware trading (auto qty reduction)
+// ✅ Trailing SL · Telegram alerts · PostgreSQL persistence
 // ═══════════════════════════════════════════════════════════════════════════
 
 import axios from "axios";
@@ -11,11 +20,10 @@ import fs from "fs";
 import dotenv from "dotenv";
 import {
   initDB, logSignal, logTrade, closeTrade as dbCloseTrade,
-  updateSLMovement, logEvent, startAPI
+  updateSLMovement, logEvent, startAPI, db
 } from "./db-api.js";
 import { addAccountEndpoints } from "./angel-account-api.js";
 import { addBacktestEndpoints } from "./backtest-api.js";
-import { addBalanceEndpoints, smartBalanceCheck } from "./balance-optimized.js";
 
 dotenv.config();
 
@@ -23,16 +31,20 @@ dotenv.config();
 // CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 const CONFIG = {
-  CAPITAL:           250000,
-  RISK_PER_TRADE:    1000,
-  REWARD_RATIO:      2,
-  DAILY_LOSS_CAP:    2500,
-  MAX_POSITIONS:     3,
-  LIVE_TRADING:      process.env.LIVE_TRADING === "true",
+  CAPITAL:         250000,
+  RISK_PER_TRADE:  1000,
+  REWARD_RATIO:    4,           // 1:4 RR (only need 25% win rate)
+  DAILY_LOSS_CAP:  2500,
+  MAX_POSITIONS:   3,
+  LIVE_TRADING:    process.env.LIVE_TRADING === "true",
 
-  SL_PCT:            0.006,
-  TARGET_PCT:        0.024,
+  // ─── Risk-reward (ATR-based) ───
+  SL_PCT:          0.006,
+  TARGET_PCT:      0.024,
+  ATR_SL_MULT:     1.5,
+  ATR_TARGET_MULT: 4.5,
 
+  // ─── Signal thresholds ───
   SIGNAL_SCORE_BUY:  4.0,
   SIGNAL_SCORE_SELL: -4.0,
   MIN_CONFLUENCE:    4,
@@ -40,11 +52,33 @@ const CONFIG = {
   MIN_VOLUME_RATIO:  1.3,
   MIN_CANDLES:       30,
   MIN_ADX:           25,
-  SCAN_INTERVAL_MS:  20000,
 
+  // ─── Market hours (strict 9 AM - 4 PM IST) ───
+  MARKET_START_HOUR: 9,
+  MARKET_START_MIN:  15,
+  MARKET_END_HOUR:   15,
+  MARKET_END_MIN:    30,
+
+  // ─── Scheduler ───
+  SCAN_INTERVAL_MS:    20000,
+  WATCHDOG_INTERVAL_MS: 60000,
+  SCHEDULER_TIMEOUT_MS: 90000,
+
+  // ─── Forced signal logic ───
   FORCE_SIGNAL_AFTER_HOUR: 12,
   FORCE_SIGNAL_MAX_HOUR:   14.5,
 
+  // ─── Balance protection ───
+  MIN_CASH_BUFFER:        5000,
+  MAX_CAPITAL_PER_TRADE:  0.30,
+  MAX_TOTAL_EXPOSURE:     0.80,
+
+  // ─── AI features ───
+  USE_AI_SENTIMENT:    process.env.USE_AI_SENTIMENT === "true",
+  AI_SENTIMENT_MIN_CONFIDENCE: 70,  // Only check AI for high-confidence signals
+  USE_STATISTICAL_LEARNING: true,    // Adjust confidence based on historical wins
+
+  // ─── Watchlist ───
   WATCHLIST: [
     "RELIANCE","HDFCBANK","ICICIBANK","INFY","TCS","HINDUNILVR","ITC","BHARTIARTL",
     "SBIN","LT","KOTAKBANK","AXISBANK","BAJFINANCE","ASIANPAINT","MARUTI",
@@ -52,25 +86,43 @@ const CONFIG = {
     "POWERGRID","TATASTEEL","TECHM","ONGC","JSWSTEEL","ADANIENT","ADANIPORTS",
     "COALINDIA","BAJAJFINSV","GRASIM","HINDALCO","DRREDDY","BRITANNIA",
     "CIPLA","BPCL","INDUSINDBK","EICHERMOT","APOLLOHOSP","HEROMOTOCO",
-    "DIVISLAB","UPL","SBILIFE","HDFCLIFE",
+    "DIVISLAB","TATAMOTORS","UPL","SBILIFE","HDFCLIFE","LTIM",
     "TATACONSUM","BAJAJHLDNG","DMART"
-  ],
-
-  UNSAFE_WINDOWS: [
-    { start: "09:15", end: "09:20", reason: "Opening volatility" },
-    { start: "15:20", end: "15:30", reason: "Closing square-off" }
   ],
 };
 
 const ENV = {
-  ANGEL_CLIENT_ID:  process.env.ANGEL_CLIENT_ID,
-  ANGEL_API_KEY:    process.env.ANGEL_API_KEY,
-  ANGEL_MPIN:       process.env.ANGEL_MPIN,
-  ANGEL_TOTP_TOKEN: process.env.ANGEL_TOTP_TOKEN,
-  TELEGRAM_TOKEN:   process.env.TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
+  ANGEL_CLIENT_ID:   process.env.ANGEL_CLIENT_ID,
+  ANGEL_API_KEY:     process.env.ANGEL_API_KEY,
+  ANGEL_MPIN:        process.env.ANGEL_MPIN,
+  ANGEL_TOTP_TOKEN:  process.env.ANGEL_TOTP_TOKEN,
+  TELEGRAM_TOKEN:    process.env.TELEGRAM_BOT_TOKEN,
+  TELEGRAM_CHAT_ID:  process.env.TELEGRAM_CHAT_ID,
+  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// HARDCODED NIFTY 50 TOKENS — Ultimate fallback
+// ═══════════════════════════════════════════════════════════════════════════
+const NIFTY_50_FALLBACK_TOKENS = {
+  "RELIANCE":"2885","HDFCBANK":"1333","ICICIBANK":"4963","INFY":"1594",
+  "TCS":"11536","HINDUNILVR":"1394","ITC":"1660","BHARTIARTL":"10604",
+  "SBIN":"3045","LT":"11483","KOTAKBANK":"1922","AXISBANK":"5900",
+  "BAJFINANCE":"317","ASIANPAINT":"236","MARUTI":"10999","SUNPHARMA":"3351",
+  "TITAN":"3506","HCLTECH":"7229","ULTRACEMCO":"11532","NTPC":"11630",
+  "WIPRO":"3787","NESTLEIND":"17963","POWERGRID":"14977","TATASTEEL":"3499",
+  "TECHM":"13538","ONGC":"2475","JSWSTEEL":"11723","ADANIENT":"25",
+  "ADANIPORTS":"15083","COALINDIA":"20374","BAJAJFINSV":"16675","GRASIM":"1232",
+  "HINDALCO":"1363","DRREDDY":"881","BRITANNIA":"547","CIPLA":"694",
+  "BPCL":"526","INDUSINDBK":"5258","EICHERMOT":"910","APOLLOHOSP":"157",
+  "HEROMOTOCO":"1348","DIVISLAB":"10940","TATAMOTORS":"3456","UPL":"11287",
+  "SBILIFE":"21808","HDFCLIFE":"467","LTIM":"17818","TATACONSUM":"3432",
+  "BAJAJHLDNG":"16669","DMART":"19913",
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GLOBAL STATE
+// ═══════════════════════════════════════════════════════════════════════════
 export const state = {
   angelAuth: null, feedToken: null, ws: null,
   livePrices: new Map(), candleBuffer: new Map(),
@@ -79,8 +131,16 @@ export const state = {
   symbolTokens: new Map(), tokenToSymbol: new Map(),
   scanCount: 0, lastScanTime: null,
   signalsToday: 0, forcedSignalSent: false,
-  scripMaster: null, scripMasterLoaded: false,
+  scripMaster: null, scripMasterLoaded: false, usingFallback: false,
+  symbolStats: new Map(),  // For statistical learning
+  cachedBalance: null, balanceCacheTime: 0,
 };
+
+let schedulerRunning = false;
+let lastScanCompletedAt = null;
+let scansSkippedClosedMarket = 0;
+let scanInterval = null;
+let watchdogInterval = null;
 
 function log(msg) {
   const ts = new Date().toISOString().replace("T", " ").substring(0, 19);
@@ -88,88 +148,88 @@ function log(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ANGEL ONE STANDARD HEADERS (CRITICAL - required for all Angel API calls)
-// ═══════════════════════════════════════════════════════════════════════════
-function angelApiHeaders() {
-  return {
-    "Authorization":    `Bearer ${state.angelAuth}`,
-    "Content-Type":     "application/json",
-    "Accept":           "application/json",
-    "X-UserType":       "USER",
-    "X-SourceID":       "WEB",
-    "X-ClientLocalIP":  "192.168.1.1",
-    "X-ClientPublicIP": "103.0.0.1",
-    "X-MACAddress":     "00:00:00:00:00:00",
-    "X-PrivateKey":     ENV.ANGEL_API_KEY,
-  };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// FIX: IST TIMEZONE DATE FORMATTING
+// IST DATE HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 function getISTDate() {
-  // Convert server time (UTC on Railway) to IST
   const now = new Date();
-  const utcMs = now.getTime() + (now.getTimezoneOffset() * 60 * 1000);
-  return new Date(utcMs + (5.5 * 60 * 60 * 1000));
+  return new Date(now.getTime() + (now.getTimezoneOffset() * 60 * 1000) + (5.5 * 60 * 60 * 1000));
 }
 
-function formatAngelDate(date) {
+function formatAngelDate(d) {
   const pad = n => n.toString().padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-// Returns valid trading day range (skips weekends)
 function getTradingDayRange(daysBack = 5) {
   let end = getISTDate();
-
-  // If before market open today, use yesterday
   if (end.getHours() < 9 || (end.getHours() === 9 && end.getMinutes() < 15)) {
     end.setDate(end.getDate() - 1);
   }
-  // Skip weekends backwards to nearest trading day
-  while (end.getDay() === 0 || end.getDay() === 6) {
-    end.setDate(end.getDate() - 1);
-  }
+  while (end.getDay() === 0 || end.getDay() === 6) end.setDate(end.getDate() - 1);
   end.setHours(15, 30, 0, 0);
 
-  // Go back N trading days
   let start = new Date(end);
-  let tradingDays = 0;
-  while (tradingDays < daysBack) {
+  let trading = 0;
+  while (trading < daysBack) {
     start.setDate(start.getDate() - 1);
-    if (start.getDay() !== 0 && start.getDay() !== 6) tradingDays++;
+    if (start.getDay() !== 0 && start.getDay() !== 6) trading++;
   }
   start.setHours(9, 15, 0, 0);
+  return { fromdate: formatAngelDate(start), todate: formatAngelDate(end) };
+}
 
-  return {
-    fromdate: formatAngelDate(start),
-    todate:   formatAngelDate(end),
-  };
+function isMarketHours() {
+  const ist = getISTDate();
+  const day = ist.getDay();
+  if (day === 0 || day === 6) return false;
+  const totalMins = ist.getHours() * 60 + ist.getMinutes();
+  const startMins = CONFIG.MARKET_START_HOUR * 60 + CONFIG.MARKET_START_MIN;
+  const endMins = CONFIG.MARKET_END_HOUR * 60 + CONFIG.MARKET_END_MIN;
+  return totalMins >= startMins && totalMins <= endMins;
+}
+
+function getMarketStatus() {
+  const ist = getISTDate();
+  const day = ist.getDay();
+  const totalMins = ist.getHours() * 60 + ist.getMinutes();
+  const startMins = CONFIG.MARKET_START_HOUR * 60 + CONFIG.MARKET_START_MIN;
+  const endMins = CONFIG.MARKET_END_HOUR * 60 + CONFIG.MARKET_END_MIN;
+
+  if (day === 0 || day === 6) return { status: "closed", reason: "Weekend" };
+  if (totalMins < startMins) {
+    const m = startMins - totalMins;
+    return { status: "pre_market", reason: `Opens in ${Math.floor(m / 60)}h ${m % 60}m` };
+  }
+  if (totalMins > endMins) return { status: "post_market", reason: "Closed for today" };
+  return { status: "open", reason: "Market is live" };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 1. ANGEL ONE AUTHENTICATION
+// ANGEL ONE AUTH
 // ═══════════════════════════════════════════════════════════════════════════
+function angelHeaders() {
+  return {
+    "Authorization": `Bearer ${state.angelAuth}`,
+    "Content-Type": "application/json", "Accept": "application/json",
+    "X-UserType": "USER", "X-SourceID": "WEB",
+    "X-ClientLocalIP": "192.168.1.1", "X-ClientPublicIP": "103.0.0.1",
+    "X-MACAddress": "00:00:00:00:00:00", "X-PrivateKey": ENV.ANGEL_API_KEY,
+  };
+}
+
 async function authenticateAngel() {
   log("🔐 Authenticating with Angel One...");
   try {
     const totp = authenticator.generate(ENV.ANGEL_TOTP_TOKEN);
     const res = await axios.post(
-        "https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword",
-        { clientcode: ENV.ANGEL_CLIENT_ID, password: ENV.ANGEL_MPIN, totp },
-        {
-          headers: {
-            "Content-Type":     "application/json",
-            "Accept":           "application/json",
-            "X-UserType":       "USER",
-            "X-SourceID":       "WEB",
-            "X-ClientLocalIP":  "192.168.1.1",
-            "X-ClientPublicIP": "103.0.0.1",
-            "X-MACAddress":     "00:00:00:00:00:00",
-            "X-PrivateKey":     ENV.ANGEL_API_KEY,
-          },
-        }
+      "https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword",
+      { clientcode: ENV.ANGEL_CLIENT_ID, password: ENV.ANGEL_MPIN, totp },
+      { headers: {
+        "Content-Type": "application/json", "Accept": "application/json",
+        "X-UserType": "USER", "X-SourceID": "WEB",
+        "X-ClientLocalIP": "192.168.1.1", "X-ClientPublicIP": "103.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00", "X-PrivateKey": ENV.ANGEL_API_KEY,
+      }}
     );
     if (res.data?.data?.jwtToken) {
       state.angelAuth = res.data.data.jwtToken;
@@ -190,48 +250,93 @@ setInterval(async () => {
 }, 6 * 60 * 60 * 1000);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 2. SCRIP MASTER — LOAD ONCE, KEEP IN MEMORY
+// SCRIP MASTER — BULLETPROOF (3 strategies)
 // ═══════════════════════════════════════════════════════════════════════════
-async function loadScripMasterOnce() {
+const SCRIP_MASTER_URLS = [
+  "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
+  "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
+];
+const SCRIP_CACHE_PATH = "./scrip-master.json";
+
+async function loadScripMasterRobust() {
   if (state.scripMasterLoaded) return true;
 
-  log("⬇️ Downloading Angel scrip master...");
-  try {
-    const res = await axios.get(
-        "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
-        { timeout: 120000, maxContentLength: 200*1024*1024, maxBodyLength: 200*1024*1024 }
-    );
-    state.scripMaster = res.data;
-    state.scripMasterLoaded = true;
-    log(`✅ Scrip master loaded: ${state.scripMaster.length} instruments`);
+  // Strategy 1: Disk cache
+  if (fs.existsSync(SCRIP_CACHE_PATH)) {
     try {
-      fs.writeFileSync("./scrip-master.json", JSON.stringify(state.scripMaster));
-    } catch {}
-    return true;
-  } catch (e) {
-    log(`❌ Scrip master download failed: ${e.message}`);
-    try {
-      if (fs.existsSync("./scrip-master.json")) {
-        state.scripMaster = JSON.parse(fs.readFileSync("./scrip-master.json", "utf8"));
+      const stats = fs.statSync(SCRIP_CACHE_PATH);
+      const ageHours = (Date.now() - stats.mtimeMs) / (1000 * 60 * 60);
+      const data = JSON.parse(fs.readFileSync(SCRIP_CACHE_PATH, "utf8"));
+      if (data?.length > 1000) {
+        state.scripMaster = data;
         state.scripMasterLoaded = true;
-        log(`✅ Loaded from disk: ${state.scripMaster.length} items`);
+        log(`✅ Scrip master from disk: ${data.length} items (${ageHours.toFixed(1)}h old)`);
+        if (ageHours > 24) setTimeout(() => downloadScripMaster(true), 5000);
         return true;
       }
-    } catch {}
-    return false;
+    } catch (e) { log(`⚠️ Cache corrupt: ${e.message}`); }
   }
+
+  // Strategy 2: Download with retries
+  if (await downloadScripMaster(false)) return true;
+
+  // Strategy 3: Hardcoded fallback (always works)
+  log("⚠️ Downloads failed · using Nifty 50 fallback");
+  state.scripMaster = Object.entries(NIFTY_50_FALLBACK_TOKENS).map(([sym, tok]) => ({
+    symbol: `${sym}-EQ`, name: sym, token: tok, exch_seg: "NSE",
+  }));
+  state.scripMasterLoaded = true;
+  state.usingFallback = true;
+  log(`✅ Using ${state.scripMaster.length} hardcoded Nifty 50 tokens`);
+  setTimeout(() => downloadScripMaster(true), 30000);
+  return true;
+}
+
+async function downloadScripMaster(silent = false) {
+  for (const url of SCRIP_MASTER_URLS) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        if (!silent) log(`⬇️ ${url} (try ${attempt}/3)`);
+        const res = await axios.get(url, {
+          timeout: 60000,
+          maxContentLength: 200 * 1024 * 1024,
+          headers: { "User-Agent": "Mozilla/5.0" },
+        });
+        if (res.data && Array.isArray(res.data) && res.data.length > 1000) {
+          state.scripMaster = res.data;
+          state.scripMasterLoaded = true;
+          state.usingFallback = false;
+          try {
+            fs.writeFileSync(SCRIP_CACHE_PATH, JSON.stringify(res.data));
+            log(`💾 Cached ${res.data.length} instruments`);
+          } catch {}
+          log(`✅ Downloaded: ${res.data.length} instruments`);
+          return true;
+        }
+      } catch (e) {
+        if (!silent) log(`⚠️ Try ${attempt} failed: ${e.message}`);
+        if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
+      }
+    }
+  }
+  return false;
 }
 
 async function getSymbolToken(symbol) {
   if (state.symbolTokens.has(symbol)) return state.symbolTokens.get(symbol);
-  if (!state.scripMasterLoaded) await loadScripMasterOnce();
+  if (!state.scripMasterLoaded) await loadScripMasterRobust();
+
+  // Hardcoded fallback first
+  if (NIFTY_50_FALLBACK_TOKENS[symbol]) {
+    const token = NIFTY_50_FALLBACK_TOKENS[symbol];
+    state.symbolTokens.set(symbol, token);
+    state.tokenToSymbol.set(token, symbol);
+    return token;
+  }
+
   if (!state.scripMaster) return null;
-
-  const searchName = `${symbol}-EQ`;
-  let match = state.scripMaster.find(s => s.symbol === searchName && s.exch_seg === "NSE");
-  if (!match) match = state.scripMaster.find(s => s.name === symbol && s.exch_seg === "NSE" && s.symbol.endsWith("-EQ"));
-  if (!match) match = state.scripMaster.find(s => s.symbol === symbol && s.exch_seg === "NSE");
-
+  let match = state.scripMaster.find(s => s.symbol === `${symbol}-EQ` && s.exch_seg === "NSE");
+  if (!match) match = state.scripMaster.find(s => s.name === symbol && s.exch_seg === "NSE" && s.symbol?.endsWith("-EQ"));
   if (match?.token) {
     state.symbolTokens.set(symbol, match.token);
     state.tokenToSymbol.set(match.token, symbol);
@@ -242,72 +347,41 @@ async function getSymbolToken(symbol) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 3. HISTORICAL CANDLE LOADER — FIXED
+// HISTORICAL CANDLES
 // ═══════════════════════════════════════════════════════════════════════════
 async function loadHistoricalCandles(symbol, retries = 2) {
   const token = await getSymbolToken(symbol);
   if (!token) return 0;
-
   const { fromdate, todate } = getTradingDayRange(5);
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await axios.post(
-          "https://apiconnect.angelbroking.com/rest/secure/angelbroking/historical/v1/getCandleData",
-          {
-            exchange:    "NSE",
-            symboltoken: token,
-            interval:    "FIVE_MINUTE",
-            fromdate,
-            todate,
-          },
-          {
-            headers: angelApiHeaders(),
-            timeout: 20000,
-          }
+        "https://apiconnect.angelbroking.com/rest/secure/angelbroking/historical/v1/getCandleData",
+        { exchange: "NSE", symboltoken: token, interval: "FIVE_MINUTE", fromdate, todate },
+        { headers: angelHeaders(), timeout: 20000 }
       );
-
       const data = res.data?.data || [];
       if (data.length > 0) {
         const candles = data.map(c => ({
-          bucket: c[0],
-          o: parseFloat(c[1]),
-          h: parseFloat(c[2]),
-          l: parseFloat(c[3]),
-          c: parseFloat(c[4]),
-          v: parseInt(c[5]),
+          bucket: c[0], o: parseFloat(c[1]), h: parseFloat(c[2]),
+          l: parseFloat(c[3]), c: parseFloat(c[4]), v: parseInt(c[5]),
         }));
         state.candleBuffer.set(symbol, candles);
         return candles.length;
       }
-
-      // Empty response — no retry needed
       return 0;
-
     } catch (e) {
       const status = e.response?.status;
-      const body = e.response?.data;
-
-      // Log detailed error on first attempt
-      if (attempt === 0) {
-        log(`  ⚠️ ${symbol}: HTTP ${status} · ${JSON.stringify(body).substring(0, 150)}`);
-      }
-
-      // Rate limit — wait longer before retry
-      if (status === 429 || status === 403) {
-        if (attempt < retries) {
-          await new Promise(r => setTimeout(r, 3000));
-          continue;
-        }
-      }
-
-      // 401 = token expired, re-auth and retry
       if (status === 401 && attempt < retries) {
-        log("  🔄 Token expired, re-authenticating...");
         await authenticateAngel();
         continue;
       }
-
+      if (status === 429 && attempt < retries) {
+        await new Promise(r => setTimeout(r, 3000));
+        continue;
+      }
+      if (attempt === 0) log(`  ⚠️ ${symbol}: HTTP ${status}`);
       return 0;
     }
   }
@@ -315,24 +389,22 @@ async function loadHistoricalCandles(symbol, retries = 2) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 4. WEBSOCKET (unchanged — already working)
+// WEBSOCKET
 // ═══════════════════════════════════════════════════════════════════════════
 async function startWebSocket(tokens) {
   if (!tokens?.length) return;
-
   const wsUrl = `wss://smartapisocket.angelone.in/smart-stream?clientCode=${ENV.ANGEL_CLIENT_ID}&feedToken=${state.feedToken}&apiKey=${ENV.ANGEL_API_KEY}`;
   state.ws = new WebSocket(wsUrl);
 
   state.ws.on("open", () => {
-    log(`📡 WebSocket connected · subscribing to ${tokens.length} tokens`);
+    log(`📡 WebSocket connected · ${tokens.length} tokens`);
     const chunks = [];
     for (let i = 0; i < tokens.length; i += 50) chunks.push(tokens.slice(i, i + 50));
     chunks.forEach((chunk, i) => {
       setTimeout(() => {
         if (state.ws?.readyState === WebSocket.OPEN) {
           state.ws.send(JSON.stringify({
-            correlationID: `nseaibot-${i}`,
-            action: 1,
+            correlationID: `nseaibot-${i}`, action: 1,
             params: { mode: 2, tokenList: [{ exchangeType: 1, tokens: chunk }] }
           }));
         }
@@ -346,7 +418,7 @@ async function startWebSocket(tokens) {
       const tick = parseBinaryTick(data);
       if (tick?.token) {
         tickCount++;
-        if (tickCount % 500 === 0) log(`📡 ${tickCount} ticks · ${state.livePrices.size} stocks tracked`);
+        if (tickCount % 500 === 0) log(`📡 ${tickCount} ticks · ${state.livePrices.size} stocks`);
         const symbol = state.tokenToSymbol.get(tick.token);
         if (symbol) {
           state.livePrices.set(symbol, {
@@ -405,39 +477,127 @@ function updateCandles(symbol, ltp, vol) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// INDICATORS (compact, same logic)
+// INDICATORS (all 7)
 // ═══════════════════════════════════════════════════════════════════════════
-function ema(v,p){if(v.length<p)return v[v.length-1]||0;const k=2/(p+1);let e=v.slice(0,p).reduce((a,b)=>a+b,0)/p;for(let i=p;i<v.length;i++)e=v[i]*k+e*(1-k);return e;}
-function sma(v,p){if(v.length<p)return v[v.length-1]||0;return v.slice(-p).reduce((a,b)=>a+b,0)/p;}
-function rsi(c,p=14){if(c.length<p+1)return 50;const ch=c.slice(1).map((x,i)=>x-c[i]);const g=ch.map(x=>x>0?x:0);const l=ch.map(x=>x<0?-x:0);let ag=g.slice(0,p).reduce((a,b)=>a+b,0)/p;let al=l.slice(0,p).reduce((a,b)=>a+b,0)/p;for(let i=p;i<ch.length;i++){ag=(ag*(p-1)+g[i])/p;al=(al*(p-1)+l[i])/p;}return 100-100/(1+ag/(al||0.001));}
-function macd(c){const e12=ema(c,12),e26=ema(c,26);return{value:e12-e26,bullish:e12>e26};}
-function vwap(cs){if(!cs.length)return 0;let pv=0,tv=0;for(const c of cs){const t=(c.h+c.l+c.c)/3;pv+=t*c.v;tv+=c.v;}return tv>0?pv/tv:cs[cs.length-1].c;}
-function atr(cs,p=14){if(cs.length<p+1)return 0;const trs=[];for(let i=1;i<cs.length;i++){const h=cs[i].h,l=cs[i].l,pc=cs[i-1].c;trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));}return sma(trs.slice(-p),p);}
-function adx(cs,p=14){if(cs.length<p*2)return{adx:0,plusDI:0,minusDI:0,trending:false};const pdms=[],mdms=[],trs=[];for(let i=1;i<cs.length;i++){const um=cs[i].h-cs[i-1].h,dm=cs[i-1].l-cs[i].l;pdms.push(um>dm&&um>0?um:0);mdms.push(dm>um&&dm>0?dm:0);const h=cs[i].h,l=cs[i].l,pc=cs[i-1].c;trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));}const stt=sma(trs.slice(-p),p),spm=sma(pdms.slice(-p),p),smm=sma(mdms.slice(-p),p);const pdi=(spm/(stt||1))*100,mdi=(smm/(stt||1))*100;const dx=Math.abs(pdi-mdi)/((pdi+mdi)||1)*100;return{adx:dx,plusDI:pdi,minusDI:mdi,trending:dx>25};}
-function supertrend(cs,p=10,m=3){if(cs.length<p)return{trend:"neutral"};const a=atr(cs,p),l=cs[cs.length-1];const hl2=(l.h+l.l)/2,ub=hl2+m*a,lb=hl2-m*a;return{trend:l.c>ub?"bull":l.c<lb?"bear":"neutral"};}
-function bollinger(c,p=20){if(c.length<p)return{upper:0,lower:0,mid:0};const s=c.slice(-p),m=s.reduce((a,b)=>a+b,0)/p,sd=Math.sqrt(s.reduce((a,b)=>a+(b-m)**2,0)/p);return{upper:m+2*sd,mid:m,lower:m-2*sd};}
+const ema = (v, p) => { if (v.length < p) return v[v.length-1] || 0; const k = 2/(p+1); let e = v.slice(0,p).reduce((a,b) => a+b, 0)/p; for (let i=p; i<v.length; i++) e = v[i]*k + e*(1-k); return e; };
+const sma = (v, p) => v.length < p ? (v[v.length-1] || 0) : v.slice(-p).reduce((a,b) => a+b, 0) / p;
+function rsi(c, p=14) { if (c.length < p+1) return 50; const ch = c.slice(1).map((x,i) => x-c[i]); const g = ch.map(x => x>0?x:0); const l = ch.map(x => x<0?-x:0); let ag = g.slice(0,p).reduce((a,b) => a+b, 0)/p; let al = l.slice(0,p).reduce((a,b) => a+b, 0)/p; for (let i=p; i<ch.length; i++) { ag = (ag*(p-1)+g[i])/p; al = (al*(p-1)+l[i])/p; } return 100 - 100/(1 + ag/(al||0.001)); }
+function macd(c) { const e12 = ema(c, 12), e26 = ema(c, 26); return { value: e12 - e26, bullish: e12 > e26 }; }
+function vwap(cs) { if (!cs.length) return 0; let pv=0, tv=0; for (const c of cs) { pv += ((c.h+c.l+c.c)/3)*c.v; tv += c.v; } return tv > 0 ? pv/tv : cs[cs.length-1].c; }
+function atr(cs, p=14) { if (cs.length < p+1) return 0; const trs = []; for (let i=1; i<cs.length; i++) { const h=cs[i].h,l=cs[i].l,pc=cs[i-1].c; trs.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc))); } return sma(trs.slice(-p), p); }
+function adx(cs, p=14) { if (cs.length < p*2) return {adx:0, plusDI:0, minusDI:0, trending:false}; const pdms=[],mdms=[],trs=[]; for (let i=1; i<cs.length; i++) { const um=cs[i].h-cs[i-1].h, dm=cs[i-1].l-cs[i].l; pdms.push(um>dm && um>0 ? um : 0); mdms.push(dm>um && dm>0 ? dm : 0); const h=cs[i].h,l=cs[i].l,pc=cs[i-1].c; trs.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc))); } const stt=sma(trs.slice(-p),p), spm=sma(pdms.slice(-p),p), smm=sma(mdms.slice(-p),p); const pdi=(spm/(stt||1))*100, mdi=(smm/(stt||1))*100; return {adx: Math.abs(pdi-mdi)/((pdi+mdi)||1)*100, plusDI:pdi, minusDI:mdi, trending: Math.abs(pdi-mdi)/((pdi+mdi)||1)*100 > 25}; }
+function supertrend(cs, p=10, m=3) { if (cs.length < p) return {trend:"neutral"}; const a=atr(cs,p), l=cs[cs.length-1]; const hl2=(l.h+l.l)/2, ub=hl2+m*a, lb=hl2-m*a; return {trend: l.c > ub ? "bull" : l.c < lb ? "bear" : "neutral"}; }
+function bollinger(c, p=20) { if (c.length < p) return {upper:0,lower:0,mid:0}; const s=c.slice(-p), m=s.reduce((a,b) => a+b, 0)/p, sd=Math.sqrt(s.reduce((a,b) => a+(b-m)**2, 0)/p); return {upper: m+2*sd, mid: m, lower: m-2*sd}; }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// STRATEGY
+// STATISTICAL LEARNING — Updates symbol win rates from DB
 // ═══════════════════════════════════════════════════════════════════════════
+async function updateSymbolStats() {
+  if (!CONFIG.USE_STATISTICAL_LEARNING) return;
+  try {
+    const r = await db.query(`
+      SELECT symbol,
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE pnl > 0) AS wins,
+        AVG(pnl) AS avg_pnl
+      FROM trades
+      WHERE status = 'closed' AND closed_at > NOW() - INTERVAL '30 days'
+      GROUP BY symbol
+      HAVING COUNT(*) >= 5
+    `);
+    state.symbolStats.clear();
+    r.rows.forEach(row => {
+      state.symbolStats.set(row.symbol, {
+        winRate: parseFloat(row.wins) / parseFloat(row.total),
+        total: parseInt(row.total),
+        avgPnL: parseFloat(row.avg_pnl),
+      });
+    });
+    log(`📊 Symbol stats updated: ${state.symbolStats.size} stocks with history`);
+  } catch (e) {
+    log(`⚠️ Symbol stats update failed: ${e.message}`);
+  }
+}
 
-function analyzeSignal(symbol, candles, relaxed = false) {
-  if (candles.length < CONFIG.MIN_CANDLES) {
-    return { rejected: true, reason: `${candles.length} candles` };
+// Update every hour
+setInterval(updateSymbolStats, 60 * 60 * 1000);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CLAUDE AI SENTIMENT LAYER (optional)
+// ═══════════════════════════════════════════════════════════════════════════
+async function getAISentiment(symbol, signal, indicators) {
+  if (!CONFIG.USE_AI_SENTIMENT || !ENV.ANTHROPIC_API_KEY) {
+    return { sentiment: "NEUTRAL", confidence: 50, skipped: true };
   }
 
+  const prompt = `You are an NSE intraday trading analyst. A technical signal just fired:
+
+Stock: ${symbol}
+Signal: ${signal}
+RSI: ${indicators.rsi}
+ADX: ${indicators.adx}
+Supertrend: ${indicators.supertrend}
+Pattern: ${indicators.pattern || "none"}
+
+Based on current Indian market conditions (FII flows, sector trends, recent news for ${symbol}), reply ONLY with:
+
+VERDICT: AGREE / DISAGREE / NEUTRAL
+CONFIDENCE: 0-100
+REASON: One sentence
+
+Example:
+VERDICT: AGREE
+CONFIDENCE: 75
+REASON: ${symbol} sector showing strong momentum, technical signal aligns with fundamentals.`;
+
+  try {
+    const res = await axios.post(
+      "https://api.anthropic.com/v1/messages",
+      {
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }]
+      },
+      {
+        headers: {
+          "x-api-key": ENV.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        timeout: 10000,
+      }
+    );
+
+    const text = res.data?.content?.[0]?.text || "";
+    const verdictMatch = text.match(/VERDICT:\s*(AGREE|DISAGREE|NEUTRAL)/i);
+    const confMatch = text.match(/CONFIDENCE:\s*(\d+)/);
+    const reasonMatch = text.match(/REASON:\s*(.+?)(?:\n|$)/);
+
+    return {
+      sentiment: verdictMatch?.[1]?.toUpperCase() || "NEUTRAL",
+      confidence: parseInt(confMatch?.[1] || "50"),
+      reason: reasonMatch?.[1]?.trim() || "No reason given",
+      skipped: false,
+    };
+  } catch (e) {
+    log(`⚠️ AI sentiment failed for ${symbol}: ${e.message}`);
+    return { sentiment: "NEUTRAL", confidence: 50, skipped: true, error: e.message };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STRATEGY ENGINE v6.4 (with AI + statistical boost)
+// ═══════════════════════════════════════════════════════════════════════════
+function analyzeSignal(symbol, candles, relaxed = false) {
+  if (candles.length < CONFIG.MIN_CANDLES) return { rejected: true, reason: `${candles.length} candles` };
+
   const closes = candles.map(c => c.c);
-  const highs = candles.map(c => c.h);
-  const lows = candles.map(c => c.l);
   const vols = candles.map(c => c.v);
   const price = closes[closes.length - 1];
 
-  // ═══ 1. INDICATORS ═══
   const R = rsi(closes);
   const M = macd(closes);
-  const e9 = ema(closes, 9);
-  const e21 = ema(closes, 21);
-  const e50 = ema(closes, 50);
+  const e9 = ema(closes, 9), e21 = ema(closes, 21), e50 = ema(closes, 50);
   const e200 = ema(closes, Math.min(200, closes.length - 1));
   const vw = vwap(candles);
   const adxData = adx(candles);
@@ -447,100 +607,68 @@ function analyzeSignal(symbol, candles, relaxed = false) {
   const avgVol = vols.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, vols.length);
   const volRatio = avgVol > 0 ? vols[vols.length - 1] / avgVol : 1;
 
-  // ═══ 2. CRITICAL FILTERS — REJECT IF NOT TRENDING ═══
-  // This alone removes ~60% of false signals
+  // ADX trend filter
   if (!relaxed && adxData.adx < CONFIG.MIN_ADX) {
-    return {
-      rejected: true,
-      reason: `ADX ${adxData.adx.toFixed(1)} below ${CONFIG.MIN_ADX} (no trend)`,
-      symbol, signal: "HOLD"
-    };
+    return { rejected: true, reason: `ADX ${adxData.adx.toFixed(1)} < ${CONFIG.MIN_ADX}`, symbol, signal: "HOLD" };
   }
 
-  // ═══ 3. MULTI-TIMEFRAME TREND CHECK ═══
-  // Only BUY if higher timeframe (EMA200) is also bullish
   const longTermBullish = price > e200;
   const longTermBearish = price < e200;
 
-  // ═══ 4. CANDLESTICK PATTERN DETECTION ═══
-  const last = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
-  const prev2 = candles[candles.length - 3];
+  // Candlestick patterns
+  const last = candles[candles.length - 1], prev = candles[candles.length - 2];
+  const isBullishEngulfing = prev && last.c > last.o && prev.c < prev.o && last.c > prev.o && last.o < prev.c;
+  const isHammer = last && (last.c - last.l) > 2 * (last.h - last.c) && last.c > last.o;
+  const isBearishEngulfing = prev && last.c < last.o && prev.c > prev.o && last.c < prev.o && last.o > prev.c;
+  const isShootingStar = last && (last.h - last.c) > 2 * (last.c - last.l) && last.c < last.o;
 
-  // Bullish reversal patterns
-  const isBullishEngulfing = prev && last.c > last.o && prev.c < prev.o &&
-      last.c > prev.o && last.o < prev.c;
-  const isHammer = last && (last.c - last.l) > 2 * (last.h - last.c) &&
-      last.c > last.o;
-
-  // Bearish reversal patterns
-  const isBearishEngulfing = prev && last.c < last.o && prev.c > prev.o &&
-      last.c < prev.o && last.o > prev.c;
-  const isShootingStar = last && (last.h - last.c) > 2 * (last.c - last.l) &&
-      last.c < last.o;
-
-  // ═══ 5. SCORING WITH WEIGHTED INDICATORS ═══
-  let score = 0;
-  let bullCount = 0, bearCount = 0;
+  let score = 0, bullCount = 0, bearCount = 0;
   const checks = {};
 
-  // RSI (weight: 2)
-  // STRICTER: only oversold/overbought zones
+  // RSI
   if (R < 30) { score += 2.5; bullCount++; checks.rsi = "oversold"; }
   else if (R > 70) { score -= 2.5; bearCount++; checks.rsi = "overbought"; }
   else if (R < 40 && longTermBullish) { score += 1; bullCount++; checks.rsi = "bull"; }
   else if (R > 60 && longTermBearish) { score -= 1; bearCount++; checks.rsi = "bear"; }
   else checks.rsi = "neutral";
 
-  // MACD with signal line (weight: 2)
+  // MACD
   if (M.bullish && M.value > 0) { score += 2; bullCount++; checks.macd = "strong-bull"; }
   else if (!M.bullish && M.value < 0) { score -= 2; bearCount++; checks.macd = "strong-bear"; }
   else if (M.bullish) { score += 0.5; checks.macd = "weak-bull"; }
   else { score -= 0.5; checks.macd = "weak-bear"; }
 
-  // EMA alignment (weight: 2.5) — HIGHEST trend signal
-  if (e9 > e21 && e21 > e50 && e50 > e200) {
-    score += 2.5; bullCount++; checks.ema = "strong-bull-alignment";
-  }
-  else if (e9 < e21 && e21 < e50 && e50 < e200) {
-    score -= 2.5; bearCount++; checks.ema = "strong-bear-alignment";
-  }
+  // EMA alignment
+  if (e9 > e21 && e21 > e50 && e50 > e200) { score += 2.5; bullCount++; checks.ema = "strong-bull"; }
+  else if (e9 < e21 && e21 < e50 && e50 < e200) { score -= 2.5; bearCount++; checks.ema = "strong-bear"; }
   else if (e9 > e21 && e21 > e50) { score += 1; bullCount++; checks.ema = "bull"; }
   else if (e9 < e21 && e21 < e50) { score -= 1; bearCount++; checks.ema = "bear"; }
   else checks.ema = "mixed";
 
-  // VWAP (weight: 2) — CRITICAL for intraday
+  // VWAP
   if (price > vw * 1.003) { score += 2; bullCount++; checks.vwap = "above"; }
   else if (price < vw * 0.997) { score -= 2; bearCount++; checks.vwap = "below"; }
   else checks.vwap = "near";
 
-  // ADX trend strength (weight: 1.5)
+  // ADX
   if (adxData.trending && adxData.adx > 30) {
-    if (adxData.plusDI > adxData.minusDI * 1.2) {
-      score += 1.5; bullCount++; checks.adx = "strong-bull-trend";
-    } else if (adxData.minusDI > adxData.plusDI * 1.2) {
-      score -= 1.5; bearCount++; checks.adx = "strong-bear-trend";
-    }
+    if (adxData.plusDI > adxData.minusDI * 1.2) { score += 1.5; bullCount++; checks.adx = "strong-bull-trend"; }
+    else if (adxData.minusDI > adxData.plusDI * 1.2) { score -= 1.5; bearCount++; checks.adx = "strong-bear-trend"; }
   } else if (adxData.trending) {
     if (adxData.plusDI > adxData.minusDI) { score += 0.5; checks.adx = "bull-trend"; }
     else { score -= 0.5; checks.adx = "bear-trend"; }
-  } else {
-    checks.adx = "ranging";
-  }
+  } else checks.adx = "ranging";
 
-  // Supertrend (weight: 1.5) — strong directional confirmation
+  // Supertrend
   if (st.trend === "bull") { score += 1.5; bullCount++; checks.supertrend = "bull"; }
   else if (st.trend === "bear") { score -= 1.5; bearCount++; checks.supertrend = "bear"; }
   else checks.supertrend = "neutral";
 
-  // Bollinger + bounce confirmation (weight: 1)
-  if (price <= bb.lower * 1.005 && R < 35) {
-    score += 1.5; checks.bb = "oversold-bounce";  // strong reversal setup
-  } else if (price >= bb.upper * 0.995 && R > 65) {
-    score -= 1.5; checks.bb = "overbought-rejection";
-  }
+  // Bollinger
+  if (price <= bb.lower * 1.005 && R < 35) { score += 1.5; checks.bb = "oversold-bounce"; }
+  else if (price >= bb.upper * 0.995 && R > 65) { score -= 1.5; checks.bb = "overbought-rejection"; }
 
-  // Candlestick patterns (weight: 1.5)
+  // Patterns
   if (isBullishEngulfing || isHammer) {
     score += 1.5; bullCount++;
     checks.pattern = isBullishEngulfing ? "bullish-engulfing" : "hammer";
@@ -549,44 +677,37 @@ function analyzeSignal(symbol, candles, relaxed = false) {
     checks.pattern = isBearishEngulfing ? "bearish-engulfing" : "shooting-star";
   }
 
-  // Volume confirmation (multiplier)
-  if (volRatio > 2.0) score *= 1.2;       // Strong volume = boost score
+  // Volume
+  if (volRatio > 2.0) score *= 1.2;
   else if (volRatio > 1.5) score *= 1.1;
-  else if (volRatio < 0.7) score *= 0.7;  // Weak volume = reduce conviction
+  else if (volRatio < 0.7) score *= 0.7;
 
-  // ═══ 6. LONG-TERM TREND OVERRIDE ═══
-  // Don't BUY against major bearish trend
+  // Long-term override
   if (longTermBearish && score > 0) score *= 0.5;
   if (longTermBullish && score < 0) score *= 0.5;
 
-  // ═══ 7. DETERMINE SIGNAL ═══
+  // ═══ STATISTICAL LEARNING BOOST ═══
+  let statBoost = 0;
+  if (CONFIG.USE_STATISTICAL_LEARNING && state.symbolStats.has(symbol)) {
+    const stats = state.symbolStats.get(symbol);
+    if (stats.winRate > 0.6) statBoost = 0.5;       // Historically good stock
+    else if (stats.winRate < 0.4) statBoost = -0.5; // Historically bad
+    score += Math.sign(score) * statBoost;
+  }
+
   const sb = relaxed ? 2.5 : CONFIG.SIGNAL_SCORE_BUY;
   const ss = relaxed ? -2.5 : CONFIG.SIGNAL_SCORE_SELL;
   const mc = relaxed ? 3 : CONFIG.MIN_CONFLUENCE;
 
   let signal = "HOLD", confidence = 50;
-  if (score >= sb) {
-    signal = "BUY";
-    confidence = Math.min(55 + score * 3, 85);
-  } else if (score <= ss) {
-    signal = "SELL";
-    confidence = Math.min(55 + Math.abs(score) * 3, 82);
-  }
+  if (score >= sb) { signal = "BUY"; confidence = Math.min(55 + score * 3, 85); }
+  else if (score <= ss) { signal = "SELL"; confidence = Math.min(55 + Math.abs(score) * 3, 82); }
 
   const maxConf = Math.max(bullCount, bearCount);
 
-  // ═══ 8. SAFETY FILTERS ═══
-  const ist = getISTDate();
-  const mins = ist.getHours() * 60 + ist.getMinutes();
-  const unsafe = CONFIG.UNSAFE_WINDOWS.find(w => {
-    const [sh, sm] = w.start.split(":").map(Number);
-    const [eh, em] = w.end.split(":").map(Number);
-    return mins >= sh * 60 + sm && mins <= eh * 60 + em;
-  });
-
+  // Filters
   const filtersPassed = {
     confluence: maxConf >= mc,
-    time: !unsafe,
     volume: volRatio >= (relaxed ? 1.0 : CONFIG.MIN_VOLUME_RATIO),
     strength: Math.abs(score) >= Math.abs(sb),
     confidence: confidence >= (relaxed ? 60 : CONFIG.MIN_CONFIDENCE),
@@ -595,21 +716,13 @@ function analyzeSignal(symbol, candles, relaxed = false) {
   };
   const safeToTrade = Object.values(filtersPassed).every(Boolean);
 
-  // ═══ 9. ATR-BASED DYNAMIC SL/TARGET ═══
-  // Use ATR (Average True Range) for adaptive stop-loss
-  // ATR-based SL is much better than fixed percentage
-  const atrMultiplier = 1.5;  // SL = 1.5x ATR
-  const targetMultiplier = 4.5;  // Target = 4.5x ATR (1:3 RR minimum)
-
-  const stopDist = Math.max(price * CONFIG.SL_PCT, a * atrMultiplier);
-  const targetDist = Math.max(price * CONFIG.TARGET_PCT, a * targetMultiplier);
-
+  // ATR-based SL/Target
+  const stopDist = Math.max(price * CONFIG.SL_PCT, a * CONFIG.ATR_SL_MULT);
+  const targetDist = Math.max(price * CONFIG.TARGET_PCT, a * CONFIG.ATR_TARGET_MULT);
   const qty = Math.max(1, Math.floor(CONFIG.RISK_PER_TRADE / stopDist));
   const entry = parseFloat(price.toFixed(2));
   const sl = parseFloat((signal === "BUY" ? price - stopDist : price + stopDist).toFixed(2));
   const target = parseFloat((signal === "BUY" ? price + targetDist : price - targetDist).toFixed(2));
-
-  // CNC vs MIS (only for very strong signals)
   const orderType = (maxConf >= 5 && volRatio > 1.5 && confidence > 75 && adxData.adx > 30) ? "CNC" : "MIS";
 
   return {
@@ -626,12 +739,12 @@ function analyzeSignal(symbol, candles, relaxed = false) {
       supertrend: st.trend,
       atr: parseFloat(a.toFixed(2)),
       volRatio: parseFloat(volRatio.toFixed(2)),
-      price: entry,
       pattern: checks.pattern || "none",
       checks,
     },
     bullCount, bearCount,
     longTermTrend: longTermBullish ? "bullish" : longTermBearish ? "bearish" : "neutral",
+    statBoost,
     filtersPassed, safeToTrade,
     entry, sl, target, qty,
     capital: qty * entry,
@@ -643,11 +756,76 @@ function analyzeSignal(symbol, candles, relaxed = false) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// BALANCE-AWARE TRADING
+// ═══════════════════════════════════════════════════════════════════════════
+async function fetchLiveBalance(forceFresh = false) {
+  const age = Date.now() - state.balanceCacheTime;
+  if (!forceFresh && state.cachedBalance && age < 30000) return state.cachedBalance;
+
+  try {
+    const res = await axios.get(
+      "https://apiconnect.angelbroking.com/rest/secure/angelbroking/user/v1/getRMS",
+      { headers: angelHeaders(), timeout: 8000 }
+    );
+    const d = res.data?.data || {};
+    state.cachedBalance = {
+      availableCash: parseFloat(d.availablecash || 0),
+      utilisedMargin: parseFloat(d.utiliseddebits || 0),
+      realisedMTM: parseFloat(d.m2mrealised || 0),
+      unrealisedMTM: parseFloat(d.m2munrealised || 0),
+    };
+    state.balanceCacheTime = Date.now();
+    return state.cachedBalance;
+  } catch (e) {
+    return state.cachedBalance || { availableCash: 0, utilisedMargin: 0 };
+  }
+}
+
+async function balanceCheck(sig) {
+  const balance = await fetchLiveBalance(true);
+  const available = balance.availableCash || 0;
+  const isIntraday = sig.orderType === "MIS";
+  const capitalNeeded = sig.qty * sig.entry;
+  const marginNeeded = isIntraday ? capitalNeeded / 5 : capitalNeeded;
+
+  if (available - CONFIG.MIN_CASH_BUFFER < marginNeeded) {
+    const maxQty = Math.floor((available - CONFIG.MIN_CASH_BUFFER) / (isIntraday ? sig.entry / 5 : sig.entry));
+    if (maxQty < 1) return { approved: false, reason: "INSUFFICIENT_CASH", message: `Need ₹${marginNeeded.toFixed(0)}, have ₹${available.toFixed(0)}` };
+    return { approved: true, adjusted: true, suggestedQty: maxQty, message: `Qty reduced ${sig.qty} → ${maxQty}` };
+  }
+
+  const maxPerTrade = available * CONFIG.MAX_CAPITAL_PER_TRADE;
+  if (marginNeeded > maxPerTrade) {
+    const maxQty = Math.floor(maxPerTrade / (isIntraday ? sig.entry / 5 : sig.entry));
+    return { approved: true, adjusted: true, suggestedQty: maxQty, message: `Qty capped at 30% rule: ${maxQty}` };
+  }
+
+  return { approved: true, adjusted: false, suggestedQty: sig.qty, message: "OK" };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // TELEGRAM
 // ═══════════════════════════════════════════════════════════════════════════
 const tg = new TelegramBot(ENV.TELEGRAM_TOKEN, { polling: true });
 
 async function sendSignalAlert(sig, isForced = false) {
+  // Optional: AI sentiment check for high-confidence signals
+  let aiInfo = null;
+  if (CONFIG.USE_AI_SENTIMENT && sig.confidence >= CONFIG.AI_SENTIMENT_MIN_CONFIDENCE) {
+    aiInfo = await getAISentiment(sig.symbol, sig.signal, sig.indicators);
+    if (!aiInfo.skipped) {
+      // Adjust confidence based on AI verdict
+      if (aiInfo.sentiment === "AGREE") sig.confidence = Math.min(sig.confidence + 5, 90);
+      else if (aiInfo.sentiment === "DISAGREE") sig.confidence -= 10;
+
+      // Skip signal if AI strongly disagrees
+      if (aiInfo.sentiment === "DISAGREE" && aiInfo.confidence > 70) {
+        log(`🤖 AI rejected ${sig.symbol} ${sig.signal}: ${aiInfo.reason}`);
+        return;
+      }
+    }
+  }
+
   state.pendingSignals.set(sig.id, sig);
   setTimeout(() => state.pendingSignals.delete(sig.id), 120000);
   await logSignal(sig, "pending");
@@ -656,6 +834,8 @@ async function sendSignalAlert(sig, isForced = false) {
   const emoji = sig.signal === "BUY" ? "🟢" : "🔴";
   const typeBadge = sig.orderType === "CNC" ? "📦 DELIVERY" : "⚡ INTRADAY";
   const forcedTag = isForced ? "\n🎯 *Best signal of the day*" : "";
+  const aiTag = aiInfo && !aiInfo.skipped ? `\n🤖 AI: ${aiInfo.sentiment} (${aiInfo.confidence}%) — ${aiInfo.reason}` : "";
+  const statTag = sig.statBoost ? `\n📊 Stat boost: ${sig.statBoost > 0 ? "+" : ""}${sig.statBoost}` : "";
 
   const msg = `${emoji} *${sig.signal} SIGNAL* · ${typeBadge}${forcedTag}
 ━━━━━━━━━━━━━━━━━
@@ -666,9 +846,10 @@ async function sendSignalAlert(sig, isForced = false) {
 🛑 SL:     ₹${sig.sl}  (-₹${sig.maxLoss.toFixed(0)})
 📦 Qty: ${sig.qty} · ₹${sig.capital.toFixed(0)}
 
-📊 RSI ${sig.indicators.rsi} · VWAP ${sig.indicators.checks.vwap}
-📈 ADX ${sig.indicators.adx} · Supertrend ${sig.indicators.supertrend}
-Confluence ${Math.max(sig.bullCount, sig.bearCount)}/7
+📊 RSI ${sig.indicators.rsi} · ADX ${sig.indicators.adx}
+📈 VWAP ${sig.indicators.checks.vwap} · ST ${sig.indicators.supertrend}
+${sig.indicators.pattern !== "none" ? `🕯️ Pattern: ${sig.indicators.pattern}` : ""}
+Confluence ${Math.max(sig.bullCount, sig.bearCount)}/7${statTag}${aiTag}
 
 ⏰ _Expires in 2 minutes_`;
 
@@ -711,20 +892,57 @@ tg.on("callback_query", async (query) => {
   }
 });
 
+// ═══ TELEGRAM COMMANDS ═══
+tg.onText(/\/start/, async (msg) => {
+  await tg.sendMessage(msg.chat.id, `👋 *NSE TradeAI v6.4*\n\nMonitoring ${CONFIG.WATCHLIST.length} stocks · 9 AM - 4 PM IST\n\n/status · /scan · /market\n/scheduler · /positions\n/stop · /resume`, { parse_mode: "Markdown" });
+});
+
 tg.onText(/\/status/, async () => {
   const liveActive = state.openTrades.filter(t => t.mode === "live" && t.status === "open").length;
   const totalCandles = [...state.candleBuffer.values()].reduce((s, c) => s + c.length, 0);
-  const withCandles = [...state.candleBuffer.values()].filter(c => c.length >= CONFIG.MIN_CANDLES).length;
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `📊 *Bot v6.2 Status*
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `📊 *v6.4 Status*
 ━━━━━━━━━━━━━
 Live P&L: ₹${state.dayPnL.live.toFixed(0)} · Paper: ₹${state.dayPnL.paper.toFixed(0)}
 Positions: ${liveActive}/${CONFIG.MAX_POSITIONS}
 Signals today: ${state.signalsToday}
+Halted: ${state.isHalted ? "🛑" : "✅"}
 ━━━━━━━━━━━━━
 ✅ Tokens: ${state.symbolTokens.size}/${CONFIG.WATCHLIST.length}
-📊 Candles: ${totalCandles} total · ${withCandles} stocks ready
-🔄 Scans: ${state.scanCount}
-📡 Live prices: ${state.livePrices.size}`, { parse_mode: "Markdown" });
+📊 Candles: ${totalCandles} · 🔄 Scans: ${state.scanCount}
+📡 Live: ${state.livePrices.size} stocks
+🤖 AI: ${CONFIG.USE_AI_SENTIMENT ? "ON" : "OFF"} · Stats: ${state.symbolStats.size} stocks
+${state.usingFallback ? "⚠️ Using fallback scrip master" : ""}`, { parse_mode: "Markdown" });
+});
+
+tg.onText(/\/scan/, async () => {
+  const status = getMarketStatus();
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🔍 Force-scanning (market: ${status.status})...`);
+  const r = await runScan(true, true);
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `✅ Done · ${r.results?.alerted || 0} signals · Today: ${state.signalsToday}`);
+});
+
+tg.onText(/\/market/, async () => {
+  const status = getMarketStatus();
+  const ist = getISTDate();
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `📊 *Market Status*
+━━━━━━━━━━━━━
+${status.status === "open" ? "✅ OPEN" : status.status === "pre_market" ? "🟡 PRE-MARKET" : "🔴 CLOSED"}
+Time: ${ist.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })} IST
+Hours: ${CONFIG.MARKET_START_HOUR}:00 - ${CONFIG.MARKET_END_HOUR}:00
+${status.reason}`, { parse_mode: "Markdown" });
+});
+
+tg.onText(/\/scheduler/, async () => {
+  const stuck = lastScanCompletedAt && (Date.now() - lastScanCompletedAt.getTime()) > 90000;
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `⏰ *Scheduler*
+━━━━━━━━━━━━━
+Running: ${schedulerRunning ? "🟢 In scan" : "✅ Idle"}
+Market: ${isMarketHours() ? "OPEN" : "CLOSED"}
+Halted: ${state.isHalted ? "🛑" : "✅"}
+Scans: ${state.scanCount}
+Last: ${lastScanCompletedAt?.toLocaleTimeString("en-IN") || "never"}
+Stuck: ${stuck ? "⚠️ YES" : "✅"}
+Skipped (closed): ${scansSkippedClosedMarket}`, { parse_mode: "Markdown" });
 });
 
 tg.onText(/\/diagnose/, async () => {
@@ -738,51 +956,54 @@ tg.onText(/\/diagnose/, async () => {
   await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🔍 *Diagnosis:*\n\`\`\`\n${lines.join("\n")}\n\`\`\``, { parse_mode: "Markdown" });
 });
 
-tg.onText(/\/scan/, async () => { await runScan(true); });
 tg.onText(/\/stop/, async () => { state.isHalted = true; await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "🛑 Halted"); });
 tg.onText(/\/resume/, async () => { state.isHalted = false; await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "✅ Resumed"); });
-
-// Test historical — diagnostic command
-tg.onText(/\/testhist/, async () => {
-  const range = getTradingDayRange(5);
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🔍 Testing historical API...\nRange: ${range.fromdate} → ${range.todate}`);
-  const n = await loadHistoricalCandles("RELIANCE");
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `RELIANCE: ${n} candles loaded`);
+tg.onText(/\/positions/, async () => {
+  const active = state.openTrades.filter(t => t.status === "open");
+  if (!active.length) return tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "📭 No positions");
+  const msg = active.map(t => {
+    const cur = state.livePrices.get(t.symbol)?.ltp || t.entry;
+    const pnl = (cur - t.entry) * t.qty * (t.signal === "BUY" ? 1 : -1);
+    return `${t.mode === "live" ? "💰" : "📝"} *${t.symbol}*\n₹${t.entry} → ₹${cur.toFixed(2)}\nSL ₹${t.currentSL} · Target ₹${t.target}\nP&L: ${pnl >= 0 ? "+" : ""}₹${pnl.toFixed(0)}`;
+  }).join("\n━━━━\n");
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, msg, { parse_mode: "Markdown" });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ORDER EXECUTION
+// ═══════════════════════════════════════════════════════════════════════════
 async function executeLiveOrder(sig) {
+  const check = await balanceCheck(sig);
+  if (!check.approved) {
+    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🚫 Trade blocked: ${sig.symbol}\n${check.message}`);
+    return;
+  }
+  if (check.adjusted) {
+    sig.qty = check.suggestedQty;
+    sig.capital = sig.qty * sig.entry;
+    sig.maxLoss = sig.qty * Math.abs(sig.entry - sig.sl);
+    sig.maxGain = sig.qty * Math.abs(sig.target - sig.entry);
+    log(`📉 Qty adjusted: ${check.message}`);
+  }
+
   try {
-    const check = await smartBalanceCheck(sig, state.angelAuth, ENV.ANGEL_API_KEY);
-
-    if (!check.approved) {
-      await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
-          `🚫 *Trade Blocked*\n${sig.symbol}\n${check.message}`,
-          { parse_mode: "Markdown" });
-      return;
-    }
-
-    // If qty was adjusted, update signal
-    if (check.adjusted) {
-      sig.qty = check.suggestedQty;
-      await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
-          `📉 Qty adjusted: ${check.originalQty} → ${check.suggestedQty}\n${check.message}`);
-    }
-
     const token = await getSymbolToken(sig.symbol);
     const res = await axios.post(
-        "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
-        {
-          variety: "NORMAL", tradingsymbol: `${sig.symbol}-EQ`, symboltoken: token,
-          transactiontype: sig.signal, exchange: "NSE", ordertype: "MARKET",
-          producttype: sig.orderType === "CNC" ? "DELIVERY" : "INTRADAY",
-          duration: "DAY", quantity: sig.qty.toString(),
-        },
-        { headers: angelApiHeaders() }
+      "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
+      {
+        variety: "NORMAL", tradingsymbol: `${sig.symbol}-EQ`, symboltoken: token,
+        transactiontype: sig.signal, exchange: "NSE", ordertype: "MARKET",
+        producttype: sig.orderType === "CNC" ? "DELIVERY" : "INTRADAY",
+        duration: "DAY", quantity: sig.qty.toString(),
+      },
+      { headers: angelHeaders() }
     );
     if (res.data?.status) {
-      const trade = { ...sig, mode: "live", orderId: res.data.data.orderid,
+      const trade = {
+        ...sig, mode: "live", orderId: res.data.data.orderid,
         currentSL: sig.sl, currentPrice: sig.entry,
-        status: "open", openedAt: new Date(), trailed: false };
+        status: "open", openedAt: new Date(), trailed: false,
+      };
       state.openTrades.push(trade);
       await logTrade(trade);
       await logSignal(sig, "executed_live");
@@ -795,15 +1016,19 @@ async function executeLiveOrder(sig) {
 }
 
 function executePaperTrade(sig) {
-  const trade = { ...sig, mode: "paper", currentSL: sig.sl, currentPrice: sig.entry,
-    status: "open", openedAt: new Date(), trailed: false };
+  const trade = {
+    ...sig, mode: "paper", currentSL: sig.sl, currentPrice: sig.entry,
+    status: "open", openedAt: new Date(), trailed: false,
+  };
   state.openTrades.push(trade);
   logTrade(trade);
   logSignal(sig, "executed_paper");
   log(`📝 PAPER: ${sig.symbol} ${sig.signal}`);
 }
 
-// Trailing SL engine
+// ═══════════════════════════════════════════════════════════════════════════
+// TRAILING STOP-LOSS
+// ═══════════════════════════════════════════════════════════════════════════
 setInterval(async () => {
   for (const t of state.openTrades.filter(x => x.status === "open")) {
     const cur = state.livePrices.get(t.symbol)?.ltp;
@@ -837,240 +1062,242 @@ async function closeTrade(t, reason, exit) {
   state.dayPnL[t.mode] += t.exitPnL;
   await dbCloseTrade(t.id, exit, reason, t.exitPnL);
 
+  if (t.mode === "live" && CONFIG.LIVE_TRADING) {
+    try {
+      await axios.post(
+        "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
+        {
+          variety: "NORMAL", tradingsymbol: `${t.symbol}-EQ`,
+          symboltoken: await getSymbolToken(t.symbol),
+          transactiontype: t.signal === "BUY" ? "SELL" : "BUY",
+          exchange: "NSE", ordertype: "MARKET",
+          producttype: t.orderType === "CNC" ? "DELIVERY" : "INTRADAY",
+          duration: "DAY", quantity: t.qty.toString(),
+        },
+        { headers: angelHeaders() }
+      );
+    } catch (e) { log(`❌ Exit failed: ${e.message}`); }
+  }
+
   const emoji = reason === "TARGET_HIT" ? "🎯" : reason === "SL_HIT" ? "🛑" : "⏰";
   const pEm = t.exitPnL >= 0 ? "✅" : "❌";
   await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
-      `${emoji} *${reason.replace(/_/g, " ")}* · ${t.mode === "live" ? "💰" : "📝"}\n*${t.symbol}*\nEntry ₹${t.entry} → Exit ₹${exit}\n${pEm} P&L: ${t.exitPnL >= 0 ? "+" : ""}₹${t.exitPnL.toFixed(0)}`,
-      { parse_mode: "Markdown" });
+    `${emoji} *${reason.replace(/_/g, " ")}* · ${t.mode === "live" ? "💰" : "📝"}\n*${t.symbol}*\nEntry ₹${t.entry} → Exit ₹${exit}\n${pEm} P&L: ${t.exitPnL >= 0 ? "+" : ""}₹${t.exitPnL.toFixed(0)}`,
+    { parse_mode: "Markdown" });
   log(`${reason}: ${t.symbol} · ₹${t.exitPnL.toFixed(0)}`);
 }
 
-// Scanner
-
-let schedulerRunning = false;
-let lastScanCompletedAt = null;
-
-async function runScan(verbose = false) {
-  // Prevent overlapping scans
-  if (schedulerRunning) {
-    log("⏭️ Skipping scan (previous still running)");
-    return;
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN SCANNER
+// ═══════════════════════════════════════════════════════════════════════════
+async function runScan(verbose = false, forceRun = false) {
+  if (schedulerRunning && !forceRun) {
+    if (verbose) log("⏭️ Skipping (in progress)");
+    return { skipped: true, reason: "in_progress" };
   }
   schedulerRunning = true;
+  const startTime = Date.now();
 
   try {
-    const ist = getISTDate();
-    const mins = ist.getHours() * 60 + ist.getMinutes();
-    const isMarketHours = mins >= 555 && mins <= 930;
-
-    if (!isMarketHours) {
-      if (verbose) log(`⏰ Market closed (${ist.toLocaleTimeString("en-IN")})`);
-      schedulerRunning = false;
-      return;
+    if (!forceRun && !isMarketHours()) {
+      scansSkippedClosedMarket++;
+      const status = getMarketStatus();
+      if (verbose || scansSkippedClosedMarket % 30 === 1) log(`⏰ Market ${status.status} · ${status.reason}`);
+      return { skipped: true, reason: "market_closed", marketStatus: status };
     }
-
-    if (state.isHalted) {
-      if (verbose) log("🛑 Bot halted");
-      schedulerRunning = false;
-      return;
-    }
+    if (state.isHalted) return { skipped: true, reason: "halted" };
 
     state.scanCount++;
     state.lastScanTime = new Date();
-
-    const results = {
-      scanned: 0, noCandles: 0, inPos: 0, hold: 0,
-      filtered: 0, alerted: 0, rejectedBy: {},
-    };
+    const r = { scanned: 0, noCandles: 0, inPos: 0, hold: 0, filtered: 0, alerted: 0, rejectedBy: {} };
 
     for (const symbol of CONFIG.WATCHLIST) {
-      results.scanned++;
+      r.scanned++;
       const candles = state.candleBuffer.get(symbol);
-
-      if (!candles || candles.length < CONFIG.MIN_CANDLES) {
-        results.noCandles++;
-        continue;
-      }
-
-      if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) {
-        results.inPos++;
-        continue;
-      }
-
+      if (!candles || candles.length < CONFIG.MIN_CANDLES) { r.noCandles++; continue; }
+      if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) { r.inPos++; continue; }
       const sig = analyzeSignal(symbol, candles);
-      if (!sig || sig.rejected) {
-        results.noCandles++;
-        continue;
-      }
-
-      if (sig.signal === "HOLD") {
-        results.hold++;
-        continue;
-      }
-
+      if (!sig || sig.rejected) { r.noCandles++; continue; }
+      if (sig.signal === "HOLD") { r.hold++; continue; }
       if (!sig.safeToTrade) {
-        results.filtered++;
-        const failed = Object.entries(sig.filtersPassed).filter(([k, v]) => !v).map(([k]) => k);
-        failed.forEach(f => results.rejectedBy[f] = (results.rejectedBy[f] || 0) + 1);
+        r.filtered++;
+        Object.entries(sig.filtersPassed).filter(([k, v]) => !v).forEach(([k]) => r.rejectedBy[k] = (r.rejectedBy[k] || 0) + 1);
         continue;
       }
-
-      results.alerted++;
+      r.alerted++;
       await sendSignalAlert(sig);
     }
 
-    // Forced signal logic
-    const curHour = ist.getHours() + ist.getMinutes() / 60;
-    if (state.signalsToday === 0 && !state.forcedSignalSent &&
-        curHour >= CONFIG.FORCE_SIGNAL_AFTER_HOUR &&
-        curHour <= CONFIG.FORCE_SIGNAL_MAX_HOUR) {
-      let best = null;
-      for (const symbol of CONFIG.WATCHLIST) {
-        const candles = state.candleBuffer.get(symbol);
-        if (!candles || candles.length < CONFIG.MIN_CANDLES) continue;
-        if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) continue;
-        const sig = analyzeSignal(symbol, candles, true);
-        if (!sig || sig.signal === "HOLD") continue;
-        if (!best || Math.abs(sig.score) > Math.abs(best.score)) best = sig;
-      }
-      if (best?.safeToTrade) {
-        state.forcedSignalSent = true;
-        log(`🎯 FORCED: ${best.symbol} ${best.signal}`);
-        await sendSignalAlert(best, true);
+    if (isMarketHours()) {
+      const ist = getISTDate();
+      const curHour = ist.getHours() + ist.getMinutes() / 60;
+      if (state.signalsToday === 0 && !state.forcedSignalSent &&
+          curHour >= CONFIG.FORCE_SIGNAL_AFTER_HOUR && curHour <= CONFIG.FORCE_SIGNAL_MAX_HOUR) {
+        let best = null;
+        for (const symbol of CONFIG.WATCHLIST) {
+          const candles = state.candleBuffer.get(symbol);
+          if (!candles || candles.length < CONFIG.MIN_CANDLES) continue;
+          if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) continue;
+          const sig = analyzeSignal(symbol, candles, true);
+          if (!sig || sig.signal === "HOLD") continue;
+          if (!best || Math.abs(sig.score) > Math.abs(best.score)) best = sig;
+        }
+        if (best?.safeToTrade) {
+          state.forcedSignalSent = true;
+          log(`🎯 FORCED: ${best.symbol} ${best.signal}`);
+          await sendSignalAlert(best, true);
+        }
       }
     }
 
     lastScanCompletedAt = new Date();
-
-    // Always log scan results so you can see scheduler is alive
-    log(`🔍 Scan #${state.scanCount} · ${results.scanned} stocks | ${results.noCandles} no-data | ${results.inPos} in-trade | ${results.hold} hold | ${results.filtered} filtered | ${results.alerted} alerted`);
-
-    if (Object.keys(results.rejectedBy).length > 0 && verbose) {
-      log(`   Filter rejects: ${Object.entries(results.rejectedBy).map(([k, v]) => `${k}=${v}`).join(", ")}`);
-    }
+    log(`🔍 Scan #${state.scanCount} · ${Date.now() - startTime}ms · ${r.scanned}|${r.noCandles}nd|${r.inPos}ip|${r.hold}h|${r.filtered}f|${r.alerted}a${forceRun ? " (FORCED)" : ""}`);
+    return { skipped: false, results: r };
   } catch (e) {
     log(`💥 Scan error: ${e.message}`);
-    console.error(e);
+    return { error: e.message };
   } finally {
     schedulerRunning = false;
   }
 }
 
-let scanInterval = null;
-
 function startScheduler() {
   if (scanInterval) clearInterval(scanInterval);
-
-  log(`⏰ Starting scheduler · scan every ${CONFIG.SCAN_INTERVAL_MS / 1000}s`);
-
-  scanInterval = setInterval(() => {
-    runScan().catch(e => log(`💥 Scheduler error: ${e.message}`));
-  }, CONFIG.SCAN_INTERVAL_MS);
-
-  // Run first scan after 5s
+  log(`⏰ Scheduler · ${CONFIG.MARKET_START_HOUR}:00-${CONFIG.MARKET_END_HOUR}:00 · scan every ${CONFIG.SCAN_INTERVAL_MS / 1000}s`);
+  scanInterval = setInterval(() => runScan().catch(e => log(`💥 ${e.message}`)), CONFIG.SCAN_INTERVAL_MS);
   setTimeout(() => {
-    log("🚀 Running first scan");
-    runScan(true).catch(e => log(`💥 First scan error: ${e.message}`));
+    if (isMarketHours()) {
+      log("🚀 Initial scan");
+      runScan(true).catch(e => log(`💥 ${e.message}`));
+    } else log(`⏰ Market closed · armed for ${CONFIG.MARKET_START_HOUR}:00`);
   }, 5000);
+  startWatchdog();
 }
 
-// ═══ WATCHDOG: Restart scheduler if dead ═══════════════════════════════════
-// Add this to detect and recover from stuck scheduler:
-
-setInterval(() => {
-  if (!lastScanCompletedAt) return;
-
-  const timeSinceLastScan = Date.now() - lastScanCompletedAt.getTime();
-  const expectedInterval = CONFIG.SCAN_INTERVAL_MS;
-
-  // If scan hasn't completed in 3x expected interval, scheduler is dead
-  if (timeSinceLastScan > expectedInterval * 3) {
-    const ist = getISTDate();
-    const mins = ist.getHours() * 60 + ist.getMinutes();
-    const isMarketHours = mins >= 555 && mins <= 930;
-
-    if (isMarketHours && !state.isHalted) {
-      log(`⚠️ Scheduler appears stuck (last scan ${Math.round(timeSinceLastScan / 1000)}s ago) · restarting`);
+function startWatchdog() {
+  if (watchdogInterval) clearInterval(watchdogInterval);
+  watchdogInterval = setInterval(() => {
+    if (!isMarketHours() || state.isHalted || !lastScanCompletedAt) return;
+    const elapsed = Date.now() - lastScanCompletedAt.getTime();
+    if (elapsed > CONFIG.SCHEDULER_TIMEOUT_MS) {
+      log(`⚠️ Scheduler stuck (${Math.round(elapsed / 1000)}s) · RESTARTING`);
+      schedulerRunning = false;
       startScheduler();
     }
+  }, CONFIG.WATCHDOG_INTERVAL_MS);
+}
+
+setInterval(() => {
+  const ist = getISTDate();
+  if (ist.getHours() === 9 && ist.getMinutes() === 0) {
+    state.signalsToday = 0;
+    state.forcedSignalSent = false;
+    state.dayPnL = { live: 0, paper: 0 };
+    log("🌅 Daily reset");
   }
-}, 60000);  // Check every minute
+}, 60000);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MOBILE API ENDPOINTS — for on-demand control
+// ═══════════════════════════════════════════════════════════════════════════
+function addSchedulerEndpoints(app, auth) {
+  app.post("/api/scan/now", auth, async (req, res) => {
+    log("📱 Manual scan from mobile");
+    const r = await runScan(true, true);
+    res.json({ ok: true, forced: true, ...r });
+  });
+
+  app.get("/api/scheduler/status", auth, (req, res) => {
+    const stuck = lastScanCompletedAt && (Date.now() - lastScanCompletedAt.getTime()) > 90000;
+    res.json({
+      market: getMarketStatus(),
+      scheduler: {
+        running: schedulerRunning,
+        scansCompleted: state.scanCount,
+        lastScanAt: lastScanCompletedAt?.toISOString() || null,
+        secondsSinceLastScan: lastScanCompletedAt ? Math.round((Date.now() - lastScanCompletedAt.getTime()) / 1000) : null,
+        stuck, halted: state.isHalted,
+        skippedClosedMarket: scansSkippedClosedMarket,
+      },
+      signals: { today: state.signalsToday, forcedSignalSent: state.forcedSignalSent },
+      scripMaster: {
+        loaded: state.scripMasterLoaded,
+        usingFallback: state.usingFallback,
+        instrumentCount: state.scripMaster?.length || 0,
+      },
+      ai: { sentimentEnabled: CONFIG.USE_AI_SENTIMENT, statisticalLearning: CONFIG.USE_STATISTICAL_LEARNING, statsCount: state.symbolStats.size },
+    });
+  });
+
+  app.post("/api/scheduler/restart", auth, (req, res) => {
+    log("📱 Scheduler restart from mobile");
+    startScheduler();
+    res.json({ ok: true, message: "Scheduler restarted" });
+  });
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STARTUP
 // ═══════════════════════════════════════════════════════════════════════════
 async function startup() {
-  log("🚀 NSE TradeAI Bot v6.2 (FIXED) starting...");
-  const ist = getISTDate();
-  log(`   Current IST: ${ist.toLocaleString("en-IN")}`);
-  log(`   Watchlist: ${CONFIG.WATCHLIST.length} stocks · Live: ${CONFIG.LIVE_TRADING ? "ON" : "OFF"}`);
+  log("🚀 NSE TradeAI v6.4 · COMPLETE FINAL");
+  log(`   Capital: ₹${CONFIG.CAPITAL.toLocaleString("en-IN")} · Risk ₹${CONFIG.RISK_PER_TRADE} · RR 1:${CONFIG.REWARD_RATIO}`);
+  log(`   Market: ${CONFIG.MARKET_START_HOUR}:00 - ${CONFIG.MARKET_END_HOUR}:00 IST`);
+  log(`   Live: ${CONFIG.LIVE_TRADING ? "✅ ON" : "❌ OFF"}`);
+  log(`   AI Sentiment: ${CONFIG.USE_AI_SENTIMENT ? "ON" : "OFF"} · Stat Learning: ${CONFIG.USE_STATISTICAL_LEARNING ? "ON" : "OFF"}`);
 
   await initDB();
-  await logEvent("STARTUP", "v6.2 started");
+  await logEvent("STARTUP", "v6.4 started");
 
   const { app, auth } = startAPI(3000);
   addAccountEndpoints(app, state, auth);
   addBacktestEndpoints(app, state, auth);
-  addBalanceEndpoints(app, state, auth);
+  addSchedulerEndpoints(app, auth);
 
-  const authOk = await authenticateAngel();
-  if (!authOk) process.exit(1);
-
-  const scripOk = await loadScripMasterOnce();
-  if (!scripOk) {
-    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "❌ Scrip master failed. Retry in 60s");
-    setTimeout(() => startup(), 60000);
-    return;
-  }
+  if (!await authenticateAngel()) process.exit(1);
+  await loadScripMasterRobust();
 
   log("🔑 Resolving tokens...");
   const tokens = [];
-  const unresolved = [];
   for (const sym of CONFIG.WATCHLIST) {
     const t = await getSymbolToken(sym);
     if (t) tokens.push(t);
-    else unresolved.push(sym);
   }
   log(`✓ Resolved ${tokens.length}/${CONFIG.WATCHLIST.length}`);
 
-  // Test historical API with 1 symbol first
-  log("🧪 Testing historical API with RELIANCE...");
-  const testRange = getTradingDayRange(5);
-  log(`   Date range: ${testRange.fromdate} → ${testRange.todate}`);
-  const testCount = await loadHistoricalCandles("RELIANCE");
-
-  if (testCount === 0) {
-    log("❌ Historical API test failed · proceeding without pre-load");
-    log("   Bot will build candles live from WebSocket (takes ~75 min to get 15 candles)");
-    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
-        `⚠️ *Historical API Unavailable*\n\nProceeding without pre-load. Bot will build candles from live ticks.\nExpected first signals: ~75 minutes after market open.\n\nTest: /testhist`,
-        { parse_mode: "Markdown" });
-  } else {
-    log(`✅ Historical API works · loading rest of watchlist`);
-    let totalLoaded = testCount, successful = 1;
-    for (const sym of CONFIG.WATCHLIST) {
-      if (sym === "RELIANCE") continue;
-      const n = await loadHistoricalCandles(sym);
-      if (n > 0) { totalLoaded += n; successful++; }
-      await new Promise(r => setTimeout(r, 300));
-    }
-    log(`✅ Pre-loaded ${totalLoaded} candles from ${successful} stocks`);
+  log("📊 Loading historical candles...");
+  let totalLoaded = 0, ok = 0;
+  for (const sym of CONFIG.WATCHLIST) {
+    const n = await loadHistoricalCandles(sym);
+    if (n > 0) { totalLoaded += n; ok++; }
+    await new Promise(r => setTimeout(r, 250));
   }
+  log(`✅ Loaded ${totalLoaded} candles from ${ok}/${CONFIG.WATCHLIST.length}`);
 
+  await updateSymbolStats();
   await startWebSocket(tokens);
+  startScheduler();
 
-  const totalCandles = [...state.candleBuffer.values()].reduce((s, c) => s + c.length, 0);
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
-      `🚀 *Bot v6.2 Online*\n━━━━━━━━━━━━━━\n✅ Scrip master: ${state.scripMaster.length} items\n✅ Tokens: ${tokens.length}/${CONFIG.WATCHLIST.length}\n✅ Pre-loaded: ${totalCandles} candles\n${unresolved.length ? `⚠️ Skipped: ${unresolved.join(", ")}\n` : ""}\n${CONFIG.LIVE_TRADING ? "⚡ Live trading ON" : "📝 Paper mode"}\n\n/status · /diagnose · /scan · /testhist`,
-      { parse_mode: "Markdown" });
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🚀 *Bot v6.4 Online*
+━━━━━━━━━━━━━━
+✅ Scrip: ${state.scripMaster.length} ${state.usingFallback ? "(fallback)" : ""}
+✅ Tokens: ${tokens.length}/${CONFIG.WATCHLIST.length}
+✅ Candles: ${totalLoaded} (${ok} stocks)
+✅ Stats: ${state.symbolStats.size} stocks
+🤖 AI: ${CONFIG.USE_AI_SENTIMENT ? "ON" : "OFF"}
 
-  setTimeout(() => runScan(true), 15000);
+Market hours: ${CONFIG.MARKET_START_HOUR}:00 - ${CONFIG.MARKET_END_HOUR}:00 IST
+${CONFIG.LIVE_TRADING ? "⚡ LIVE" : "📝 Paper only"}
+
+/status · /scan · /market · /scheduler`, { parse_mode: "Markdown" });
+
   log("✅ Bot operational");
 }
 
-startup().catch(e => { log(`💥 Fatal: ${e.message}`); process.exit(1); });
+startup().catch(e => { log(`💥 Fatal: ${e.message}`); console.error(e); process.exit(1); });
 
 process.on("SIGINT", async () => {
+  log("Shutting down...");
   if (state.ws) state.ws.close();
   process.exit(0);
 });

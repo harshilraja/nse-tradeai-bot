@@ -270,12 +270,6 @@ export function addAccountEndpoints(app, state, auth) {
     res.json({ prices, count: Object.keys(prices).length });
   });
 
-  app.get("/api/account/health", auth, async (req, res) => {
-    const { getBalanceHealth } = await import("./balance-guard.js");
-    const health = await getBalanceHealth(state.angelAuth, apiKey);
-    res.json(health);
-  });
-
   // CAPITAL SUMMARY
   app.get("/api/account/capital", auth, async (req, res) => {
     const balance = await fetchBalance(state.angelAuth, apiKey);
