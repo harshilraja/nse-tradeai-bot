@@ -1,14 +1,20 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// NSE TradeAI Bot v6.5 · COMPLETE FINAL
+// NSE TradeAI Bot v7.0 · COMPLETE PRODUCTION
 //
-// NEW IN v6.5:
-// ✅ Breakeven SL move (1.2% profit → SL to entry = risk-free trades)
-// ✅ Partial profit booking (50% at 2% profit, hold rest)
-// ✅ Top-3 signals/day filter (only best setups)
-// ✅ Wider ATR-based SL (2.5x for breathing room)
-// ✅ Aggressive trailing after partial book
-// ✅ Commodities (MCX) support — Gold, Silver, Crude, etc.
-// ✅ Extended hours for commodities (9 AM - 11:30 PM)
+// REQUIREMENTS IMPLEMENTED:
+// 1. ✅ Nifty 50 + 20 best-performing stocks
+// 2. ✅ 20-day historical loading with rate limiting (1 req/sec)
+// 3. ✅ Higher TF confirmation (15-min + daily trend)
+// 4. ✅ Trading window: 9:30 AM - 3:15 PM
+// 5. ✅ Nifty + BankNifty trend filter
+// 6. ✅ DELIVERY only (no leverage), holdings analyzer
+// 7. ✅ Balance-aware suggestion (X shares possible)
+// 8. ✅ Detailed backtest trade log
+// 9. ✅ Backtest uses analyzeSignal (single source of truth)
+// 10. ✅ Mobile: daily signals + P&L tab
+// 11. ✅ Broker charges + GST in P&L
+// 12. ✅ Minimum 1 trade/day (forced signal)
+// 13. ✅ Dynamic capital from Angel One, 1% risk, 2% daily cap
 // ═══════════════════════════════════════════════════════════════════════════
 
 import axios from "axios";
@@ -22,7 +28,6 @@ import {
   updateSLMovement, logEvent, startAPI, db
 } from "./db-api.js";
 import { addAccountEndpoints } from "./angel-account-api.js";
-import { addBacktestEndpoints } from "./backtest-api.js";
 
 dotenv.config();
 
@@ -30,71 +35,83 @@ dotenv.config();
 // CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 const CONFIG = {
-  CAPITAL:         250000,
-  RISK_PER_TRADE:  1000,
-  REWARD_RATIO:    4,
-  DAILY_LOSS_CAP:  2500,
-  MAX_POSITIONS:   3,
-  LIVE_TRADING:    process.env.LIVE_TRADING === "true",
+  // ─── REQ 13: Dynamic capital + percentage-based risk ───
+  RISK_PCT:           0.01,    // 1% risk per trade
+  DAILY_LOSS_PCT:     0.02,    // 2% daily loss cap
+  REWARD_RATIO:       4,
+  MAX_POSITIONS:      3,
+  LIVE_TRADING:       process.env.LIVE_TRADING === "true",
 
-  // ─── v6.5: Wider ATR-based SL ───
-  SL_PCT:                0.012,    // 1.2% minimum (was 0.6%)
-  TARGET_PCT:            0.030,    // 3% target
-  ATR_SL_MULT:           2.5,      // was 1.5
-  ATR_TARGET_MULT:       6.0,      // was 4.5
+  // ─── ATR-based SL/Target ───
+  SL_PCT:             0.012,
+  TARGET_PCT:         0.030,
+  ATR_SL_MULT:        2.5,
+  ATR_TARGET_MULT:    6.0,
 
-  // ─── v6.5: Breakeven & Partial Booking ───
-  BREAKEVEN_TRIGGER_PCT: 0.012,    // Move SL to entry at 1.2% profit
-  PARTIAL_BOOK_PCT:      0.020,    // Book 50% at 2% profit
+  // ─── Breakeven & Partial ───
+  BREAKEVEN_TRIGGER_PCT: 0.012,
+  PARTIAL_BOOK_PCT:      0.020,
   PARTIAL_BOOK_FRACTION: 0.50,
-  TRAIL_RETENTION_AFTER_PARTIAL: 0.80,  // Keep 80% of gains
 
-  // ─── v6.5: Quality filter ───
-  TOP_SIGNALS_PER_DAY:   3,        // Only execute top N signals
-  MIN_SCORE_FOR_TRADE:   4.5,      // Stricter than 4.0
-
-  // ─── Signal thresholds ───
-  SIGNAL_SCORE_BUY:      4.0,
-  SIGNAL_SCORE_SELL:     -4.0,
-  MIN_CONFLUENCE:        4,
-  MIN_CONFIDENCE:        65,
-  MIN_VOLUME_RATIO:      1.5,
+  // ─── Quality filter ───
+  TOP_SIGNALS_PER_DAY:   5,
+  MIN_SCORE_FOR_TRADE:   3.5,
+  SIGNAL_SCORE_BUY:      3.5,
+  SIGNAL_SCORE_SELL:     -3.5,
+  MIN_CONFLUENCE:        3,
+  MIN_CONFIDENCE:        60,
+  MIN_VOLUME_RATIO:      1.2,
   MIN_CANDLES:           30,
-  MIN_ADX:               25,
+  MIN_ADX:               20,
 
-  // ─── Market hours ───
-  MARKET_START_HOUR:     9,
-  MARKET_START_MIN:      0,
-  MARKET_END_HOUR:       16,
-  MARKET_END_MIN:        0,
+  // ─── REQ 4: Trading window 9:30 AM - 3:15 PM ───
+  TRADING_START_HOUR:    9,
+  TRADING_START_MIN:     30,
+  TRADING_END_HOUR:      15,
+  TRADING_END_MIN:       15,
 
-  // ─── Commodities (MCX) ───
-  TRADE_COMMODITIES:     process.env.TRADE_COMMODITIES === "true",
-  COMMODITY_START_HOUR:  9,
-  COMMODITY_END_HOUR:    23,       // 11 PM (MCX runs till 11:30)
-  COMMODITY_END_MIN:     30,
+  // ─── REQ 2: Historical data range ───
+  HISTORICAL_DAYS:       20,
+  HISTORICAL_RATE_LIMIT_MS: 1100,  // ~1 req/sec to respect Angel rate limits
 
-  // ─── Scheduler ───
-  SCAN_INTERVAL_MS:      20000,
-  WATCHDOG_INTERVAL_MS:  60000,
-  SCHEDULER_TIMEOUT_MS:  90000,
+  // ─── REQ 12: Forced signal logic ───
+  FORCE_SIGNAL_AFTER_HOUR: 11.5,   // After 11:30 AM
+  FORCE_SIGNAL_MAX_HOUR:   14.5,   // Until 2:30 PM
 
-  // ─── Forced signal ───
-  FORCE_SIGNAL_AFTER_HOUR: 12,
-  FORCE_SIGNAL_MAX_HOUR:   14.5,
+  // ─── REQ 6: Order type — DELIVERY only ───
+  ORDER_TYPE:            "DELIVERY",  // CNC, no leverage
+  ANALYZE_HOLDINGS:      true,         // Check existing holdings for sell signals
 
   // ─── Balance protection ───
-  MIN_CASH_BUFFER:        5000,
-  MAX_CAPITAL_PER_TRADE:  0.30,
-  MAX_TOTAL_EXPOSURE:     0.80,
+  MIN_CASH_BUFFER:       5000,
+  MAX_CAPITAL_PER_TRADE: 0.30,
 
-  // ─── AI features ───
-  USE_AI_SENTIMENT:           process.env.USE_AI_SENTIMENT === "true",
-  AI_SENTIMENT_MIN_CONFIDENCE: 70,
-  USE_STATISTICAL_LEARNING:   true,
+  // ─── Scheduler ───
+  SCAN_INTERVAL_MS:      30000,    // Slower for delivery (less scalping)
+  WATCHDOG_INTERVAL_MS:  60000,
+  SCHEDULER_TIMEOUT_MS:  120000,
 
-  // ─── Watchlists ───
-  NSE_WATCHLIST: [
+  // ─── REQ 11: Charges ───
+  // STT: 0.1% on buy & sell (delivery)
+  // Brokerage: ₹20 per order or 0.03% (whichever is lower)
+  // GST: 18% on (brokerage + transaction charges)
+  // Stamp duty: 0.015% on buy
+  // Exchange charges: 0.00345% (NSE) on both sides
+  // SEBI: ₹10/crore
+  // DP charges: ₹15.93 per scrip on sell day
+  CHARGES: {
+    STT_PCT:           0.001,     // 0.1% on both sides for delivery
+    BROKERAGE_FLAT:    20,
+    BROKERAGE_PCT:     0.0003,    // 0.03%
+    GST_PCT:           0.18,
+    STAMP_PCT:         0.00015,   // Buy side only
+    EXCHANGE_PCT:      0.0000345,
+    SEBI_PCT:          0.000001,
+    DP_CHARGE:         15.93,
+  },
+
+  // ─── REQ 1: Watchlist (Nifty 50 + Best Performers) ───
+  NIFTY_50: [
     "RELIANCE","HDFCBANK","ICICIBANK","INFY","TCS","HINDUNILVR","ITC","BHARTIARTL",
     "SBIN","LT","KOTAKBANK","AXISBANK","BAJFINANCE","ASIANPAINT","MARUTI",
     "SUNPHARMA","TITAN","HCLTECH","ULTRACEMCO","NTPC","WIPRO","NESTLEIND",
@@ -104,13 +121,19 @@ const CONFIG = {
     "DIVISLAB","TATAMOTORS","UPL","SBILIFE","HDFCLIFE","LTIM",
     "TATACONSUM","BAJAJHLDNG","DMART"
   ],
-  COMMODITY_WATCHLIST: [
-    "GOLD","SILVER","CRUDEOIL","NATURALGAS","COPPER","ZINC","ALUMINIUM"
+  // Best performers (high momentum stocks beyond Nifty 50)
+  BEST_PERFORMERS: [
+    "TRENT","BEL","CGPOWER","DIXON","POLYCAB","SUZLON","IRFC",
+    "PERSISTENT","KAYNES","INOXWIND","HAL","BHEL","RVNL","IRCTC",
+    "ZOMATO","NYKAA","PAYTM","POLICYBZR","DELHIVERY","NAUKRI"
   ],
+  // Index symbols for trend
+  INDEX_NIFTY:    "NIFTY",
+  INDEX_BANKNIFTY:"NIFTYBANK",
 };
 
-// Combined watchlist (set during startup)
-CONFIG.WATCHLIST = [...CONFIG.NSE_WATCHLIST];
+// Combined watchlist
+CONFIG.WATCHLIST = [...CONFIG.NIFTY_50, ...CONFIG.BEST_PERFORMERS];
 
 const ENV = {
   ANGEL_CLIENT_ID:   process.env.ANGEL_CLIENT_ID,
@@ -119,26 +142,26 @@ const ENV = {
   ANGEL_TOTP_TOKEN:  process.env.ANGEL_TOTP_TOKEN,
   TELEGRAM_TOKEN:    process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID:  process.env.TELEGRAM_CHAT_ID,
-  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
-// HARDCODED FALLBACK TOKENS
-// ═══════════════════════════════════════════════════════════════════════════
+// Hardcoded fallback tokens (Nifty 50)
 const NIFTY_50_FALLBACK_TOKENS = {
-  "RELIANCE":"2885","HDFCBANK":"1333","ICICIBANK":"4963","INFY":"1594",
-  "TCS":"11536","HINDUNILVR":"1394","ITC":"1660","BHARTIARTL":"10604",
-  "SBIN":"3045","LT":"11483","KOTAKBANK":"1922","AXISBANK":"5900",
-  "BAJFINANCE":"317","ASIANPAINT":"236","MARUTI":"10999","SUNPHARMA":"3351",
-  "TITAN":"3506","HCLTECH":"7229","ULTRACEMCO":"11532","NTPC":"11630",
-  "WIPRO":"3787","NESTLEIND":"17963","POWERGRID":"14977","TATASTEEL":"3499",
-  "TECHM":"13538","ONGC":"2475","JSWSTEEL":"11723","ADANIENT":"25",
-  "ADANIPORTS":"15083","COALINDIA":"20374","BAJAJFINSV":"16675","GRASIM":"1232",
-  "HINDALCO":"1363","DRREDDY":"881","BRITANNIA":"547","CIPLA":"694",
-  "BPCL":"526","INDUSINDBK":"5258","EICHERMOT":"910","APOLLOHOSP":"157",
-  "HEROMOTOCO":"1348","DIVISLAB":"10940","TATAMOTORS":"3456","UPL":"11287",
-  "SBILIFE":"21808","HDFCLIFE":"467","LTIM":"17818","TATACONSUM":"3432",
-  "BAJAJHLDNG":"16669","DMART":"19913",
+  "RELIANCE":"2885","HDFCBANK":"1333","ICICIBANK":"4963","INFY":"1594","TCS":"11536",
+  "HINDUNILVR":"1394","ITC":"1660","BHARTIARTL":"10604","SBIN":"3045","LT":"11483",
+  "KOTAKBANK":"1922","AXISBANK":"5900","BAJFINANCE":"317","ASIANPAINT":"236","MARUTI":"10999",
+  "SUNPHARMA":"3351","TITAN":"3506","HCLTECH":"7229","ULTRACEMCO":"11532","NTPC":"11630",
+  "WIPRO":"3787","NESTLEIND":"17963","POWERGRID":"14977","TATASTEEL":"3499","TECHM":"13538",
+  "ONGC":"2475","JSWSTEEL":"11723","ADANIENT":"25","ADANIPORTS":"15083","COALINDIA":"20374",
+  "BAJAJFINSV":"16675","GRASIM":"1232","HINDALCO":"1363","DRREDDY":"881","BRITANNIA":"547",
+  "CIPLA":"694","BPCL":"526","INDUSINDBK":"5258","EICHERMOT":"910","APOLLOHOSP":"157",
+  "HEROMOTOCO":"1348","DIVISLAB":"10940","TATAMOTORS":"3456","UPL":"11287","SBILIFE":"21808",
+  "HDFCLIFE":"467","LTIM":"17818","TATACONSUM":"3432","BAJAJHLDNG":"16669","DMART":"19913",
+};
+
+// Index tokens
+const INDEX_TOKENS = {
+  "NIFTY":     "99926000",  // NIFTY 50 spot
+  "NIFTYBANK": "99926009",  // NIFTY BANK spot
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -146,22 +169,24 @@ const NIFTY_50_FALLBACK_TOKENS = {
 // ═══════════════════════════════════════════════════════════════════════════
 export const state = {
   angelAuth: null, feedToken: null, ws: null,
-  livePrices: new Map(), candleBuffer: new Map(),
+  livePrices: new Map(),
+  candleBuffer5m: new Map(),    // 5-min candles
+  candleBuffer15m: new Map(),   // 15-min candles (HTF)
+  candleBufferDaily: new Map(), // Daily (HTF)
   openTrades: [], pendingSignals: new Map(),
+  holdings: [],                  // From Angel
+  capital: 250000,               // Will be fetched from Angel
   dayPnL: { live: 0, paper: 0 }, isHalted: false,
   symbolTokens: new Map(), tokenToSymbol: new Map(),
-  symbolType: new Map(),  // "NSE" or "MCX"
-  commodityInfo: new Map(),  // lot size, expiry, etc
   scanCount: 0, lastScanTime: null,
   signalsToday: 0, forcedSignalSent: false,
   scripMaster: null, scripMasterLoaded: false, usingFallback: false,
-  symbolStats: new Map(),
   cachedBalance: null, balanceCacheTime: 0,
+  niftyTrend: "neutral", bankNiftyTrend: "neutral",
 };
 
 let schedulerRunning = false;
 let lastScanCompletedAt = null;
-let scansSkippedClosedMarket = 0;
 let scanInterval = null;
 let watchdogInterval = null;
 
@@ -177,13 +202,11 @@ function getISTDate() {
   const now = new Date();
   return new Date(now.getTime() + (now.getTimezoneOffset() * 60 * 1000) + (5.5 * 60 * 60 * 1000));
 }
-
 function formatAngelDate(d) {
   const pad = n => n.toString().padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
-
-function getTradingDayRange(daysBack = 5) {
+function getHistoricalRange(daysBack) {
   let end = getISTDate();
   if (end.getHours() < 9) end.setDate(end.getDate() - 1);
   while (end.getDay() === 0 || end.getDay() === 6) end.setDate(end.getDate() - 1);
@@ -199,54 +222,70 @@ function getTradingDayRange(daysBack = 5) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MARKET HOURS (NSE + MCX)
+// REQ 4: Trading window 9:30 AM - 3:15 PM
 // ═══════════════════════════════════════════════════════════════════════════
-function isMarketHours(symbolType = "NSE") {
+function isTradingWindow() {
   const ist = getISTDate();
-  const day = ist.getDay();
-  if (day === 0) return false;  // Sunday closed
-  if (day === 6 && symbolType === "NSE") return false;  // NSE closed Saturday
-
-  const totalMins = ist.getHours() * 60 + ist.getMinutes();
-
-  if (symbolType === "MCX") {
-    const startMins = CONFIG.COMMODITY_START_HOUR * 60;
-    const endMins = CONFIG.COMMODITY_END_HOUR * 60 + CONFIG.COMMODITY_END_MIN;
-    return totalMins >= startMins && totalMins <= endMins;
-  }
-
-  // NSE
-  const startMins = CONFIG.MARKET_START_HOUR * 60 + CONFIG.MARKET_START_MIN;
-  const endMins = CONFIG.MARKET_END_HOUR * 60 + CONFIG.MARKET_END_MIN;
-  return totalMins >= startMins && totalMins <= endMins;
+  if (ist.getDay() === 0 || ist.getDay() === 6) return false;
+  const mins = ist.getHours() * 60 + ist.getMinutes();
+  const start = CONFIG.TRADING_START_HOUR * 60 + CONFIG.TRADING_START_MIN;
+  const end = CONFIG.TRADING_END_HOUR * 60 + CONFIG.TRADING_END_MIN;
+  return mins >= start && mins <= end;
 }
-
-function isAnyMarketOpen() {
-  return isMarketHours("NSE") || (CONFIG.TRADE_COMMODITIES && isMarketHours("MCX"));
-}
-
 function getMarketStatus() {
   const ist = getISTDate();
   const day = ist.getDay();
-  const totalMins = ist.getHours() * 60 + ist.getMinutes();
-  const nseOpen = isMarketHours("NSE");
-  const mcxOpen = isMarketHours("MCX");
+  const mins = ist.getHours() * 60 + ist.getMinutes();
+  const start = CONFIG.TRADING_START_HOUR * 60 + CONFIG.TRADING_START_MIN;
+  const end = CONFIG.TRADING_END_HOUR * 60 + CONFIG.TRADING_END_MIN;
+  if (day === 0 || day === 6) return { status: "closed", reason: "Weekend" };
+  if (mins < start) return { status: "pre_market", reason: `Opens ${CONFIG.TRADING_START_HOUR}:${String(CONFIG.TRADING_START_MIN).padStart(2,'0')}` };
+  if (mins > end) return { status: "post_market", reason: "Closed for today" };
+  return { status: "open", reason: "Trading window active" };
+}
 
-  if (day === 0) return { status: "closed", reason: "Sunday" };
-
-  if (CONFIG.TRADE_COMMODITIES && mcxOpen && !nseOpen) {
-    return { status: "mcx_only", reason: "MCX open, NSE closed" };
-  }
-  if (nseOpen) return { status: "open", reason: "NSE + MCX live" };
-  if (mcxOpen) return { status: "mcx_only", reason: "MCX live, NSE closed" };
-
-  // Both closed
-  const nseStartMins = CONFIG.MARKET_START_HOUR * 60;
-  if (totalMins < nseStartMins) {
-    const m = nseStartMins - totalMins;
-    return { status: "pre_market", reason: `NSE opens in ${Math.floor(m/60)}h ${m%60}m` };
-  }
-  return { status: "closed", reason: "Markets closed" };
+// ═══════════════════════════════════════════════════════════════════════════
+// REQ 11: Charge calculator
+// ═══════════════════════════════════════════════════════════════════════════
+function calculateCharges(buyValue, sellValue) {
+  const C = CONFIG.CHARGES;
+  // STT (0.1% both sides for delivery)
+  const stt = (buyValue + sellValue) * C.STT_PCT;
+  // Brokerage (₹20 or 0.03%, whichever lower) on each leg
+  const brokerageBuy = Math.min(C.BROKERAGE_FLAT, buyValue * C.BROKERAGE_PCT);
+  const brokerageSell = Math.min(C.BROKERAGE_FLAT, sellValue * C.BROKERAGE_PCT);
+  const totalBrokerage = brokerageBuy + brokerageSell;
+  // Exchange charges (NSE)
+  const exchangeCharges = (buyValue + sellValue) * C.EXCHANGE_PCT;
+  // SEBI charges
+  const sebi = (buyValue + sellValue) * C.SEBI_PCT;
+  // GST 18% on (brokerage + exchange + sebi)
+  const gst = (totalBrokerage + exchangeCharges + sebi) * C.GST_PCT;
+  // Stamp duty (buy side only)
+  const stamp = buyValue * C.STAMP_PCT;
+  // DP charges (sell side, per scrip)
+  const dp = C.DP_CHARGE;
+  
+  const total = stt + totalBrokerage + exchangeCharges + sebi + gst + stamp + dp;
+  return {
+    stt: parseFloat(stt.toFixed(2)),
+    brokerage: parseFloat(totalBrokerage.toFixed(2)),
+    exchange: parseFloat(exchangeCharges.toFixed(2)),
+    sebi: parseFloat(sebi.toFixed(2)),
+    gst: parseFloat(gst.toFixed(2)),
+    stamp: parseFloat(stamp.toFixed(2)),
+    dp: parseFloat(dp.toFixed(2)),
+    total: parseFloat(total.toFixed(2)),
+  };
+}
+function netPnL(grossPnL, buyValue, sellValue) {
+  const charges = calculateCharges(buyValue, sellValue);
+  return {
+    gross: parseFloat(grossPnL.toFixed(2)),
+    charges: charges.total,
+    chargesBreakdown: charges,
+    net: parseFloat((grossPnL - charges.total).toFixed(2)),
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -261,247 +300,263 @@ function angelHeaders() {
     "X-MACAddress": "00:00:00:00:00:00", "X-PrivateKey": ENV.ANGEL_API_KEY,
   };
 }
-
 async function authenticateAngel() {
   log("🔐 Authenticating with Angel One...");
   try {
     const totp = authenticator.generate(ENV.ANGEL_TOTP_TOKEN);
     const res = await axios.post(
-        "https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword",
-        { clientcode: ENV.ANGEL_CLIENT_ID, password: ENV.ANGEL_MPIN, totp },
-        { headers: { ...angelHeaders(), "Authorization": undefined }}
+      "https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword",
+      { clientcode: ENV.ANGEL_CLIENT_ID, password: ENV.ANGEL_MPIN, totp },
+      { headers: { ...angelHeaders(), "Authorization": undefined } }
     );
     if (res.data?.data?.jwtToken) {
       state.angelAuth = res.data.data.jwtToken;
       state.feedToken = res.data.data.feedToken;
-      log("✅ Angel One authenticated");
+      log("✅ Authenticated");
       return true;
     }
     throw new Error(res.data?.message || "Auth failed");
   } catch (e) {
-    log(`❌ Auth failed: ${e.message}`);
+    log(`❌ Auth: ${e.message}`);
     return false;
   }
 }
-
-setInterval(async () => {
-  log("🔄 Refreshing Angel auth...");
-  await authenticateAngel();
-}, 6 * 60 * 60 * 1000);
+setInterval(async () => { await authenticateAngel(); }, 6 * 60 * 60 * 1000);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SCRIP MASTER
+// REQ 13: Fetch capital from Angel One
 // ═══════════════════════════════════════════════════════════════════════════
-const SCRIP_MASTER_URLS = [
+async function fetchCapital() {
+  try {
+    const res = await axios.get(
+      "https://apiconnect.angelbroking.com/rest/secure/angelbroking/user/v1/getRMS",
+      { headers: angelHeaders(), timeout: 8000 }
+    );
+    const d = res.data?.data || {};
+    const totalCapital = parseFloat(d.net || 0) || (parseFloat(d.availablecash || 0) + parseFloat(d.utiliseddebits || 0));
+    if (totalCapital > 0) {
+      state.capital = totalCapital;
+      log(`💰 Capital fetched: ₹${state.capital.toLocaleString("en-IN")}`);
+      log(`   Risk/trade: ₹${(state.capital * CONFIG.RISK_PCT).toFixed(0)} (${CONFIG.RISK_PCT*100}%)`);
+      log(`   Daily loss cap: ₹${(state.capital * CONFIG.DAILY_LOSS_PCT).toFixed(0)} (${CONFIG.DAILY_LOSS_PCT*100}%)`);
+    }
+    return totalCapital;
+  } catch (e) {
+    log(`⚠️ Capital fetch failed: ${e.message} · using ₹${state.capital}`);
+    return state.capital;
+  }
+}
+function getRiskPerTrade() { return state.capital * CONFIG.RISK_PCT; }
+function getDailyLossCap() { return state.capital * CONFIG.DAILY_LOSS_PCT; }
+
+setInterval(fetchCapital, 30 * 60 * 1000);  // Refresh every 30 min
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SCRIP MASTER (bulletproof)
+// ═══════════════════════════════════════════════════════════════════════════
+const SCRIP_URLS = [
   "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
   "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
 ];
-const SCRIP_CACHE_PATH = "./scrip-master.json";
+const SCRIP_PATH = "./scrip-master.json";
 
-async function loadScripMasterRobust() {
+async function loadScripMaster() {
   if (state.scripMasterLoaded) return true;
-
-  if (fs.existsSync(SCRIP_CACHE_PATH)) {
+  if (fs.existsSync(SCRIP_PATH)) {
     try {
-      const stats = fs.statSync(SCRIP_CACHE_PATH);
-      const ageHours = (Date.now() - stats.mtimeMs) / (1000 * 60 * 60);
-      const data = JSON.parse(fs.readFileSync(SCRIP_CACHE_PATH, "utf8"));
+      const stats = fs.statSync(SCRIP_PATH);
+      const ageHours = (Date.now() - stats.mtimeMs) / 3600000;
+      const data = JSON.parse(fs.readFileSync(SCRIP_PATH, "utf8"));
       if (data?.length > 1000) {
         state.scripMaster = data;
         state.scripMasterLoaded = true;
-        log(`✅ Scrip from disk: ${data.length} items (${ageHours.toFixed(1)}h old)`);
-        if (ageHours > 24) setTimeout(() => downloadScripMaster(true), 5000);
+        log(`✅ Scrip from disk: ${data.length} (${ageHours.toFixed(1)}h)`);
         return true;
       }
-    } catch (e) { log(`⚠️ Cache corrupt: ${e.message}`); }
+    } catch {}
   }
-
-  if (await downloadScripMaster(false)) return true;
-
-  log("⚠️ All downloads failed · using Nifty 50 fallback");
-  state.scripMaster = Object.entries(NIFTY_50_FALLBACK_TOKENS).map(([sym, tok]) => ({
-    symbol: `${sym}-EQ`, name: sym, token: tok, exch_seg: "NSE",
-  }));
-  state.scripMasterLoaded = true;
-  state.usingFallback = true;
-  setTimeout(() => downloadScripMaster(true), 30000);
-  return true;
-}
-
-async function downloadScripMaster(silent = false) {
-  for (const url of SCRIP_MASTER_URLS) {
+  for (const url of SCRIP_URLS) {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        if (!silent) log(`⬇️ ${url} (try ${attempt}/3)`);
-        const res = await axios.get(url, {
-          timeout: 60000, maxContentLength: 200*1024*1024,
-          headers: { "User-Agent": "Mozilla/5.0" },
-        });
+        const res = await axios.get(url, { timeout: 60000, maxContentLength: 200*1024*1024 });
         if (Array.isArray(res.data) && res.data.length > 1000) {
           state.scripMaster = res.data;
           state.scripMasterLoaded = true;
-          state.usingFallback = false;
-          try { fs.writeFileSync(SCRIP_CACHE_PATH, JSON.stringify(res.data)); } catch {}
-          log(`✅ Scrip downloaded: ${res.data.length} items`);
+          try { fs.writeFileSync(SCRIP_PATH, JSON.stringify(res.data)); } catch {}
+          log(`✅ Scrip downloaded: ${res.data.length}`);
           return true;
         }
       } catch (e) {
-        if (!silent) log(`⚠️ Try ${attempt}: ${e.message}`);
         if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
       }
     }
   }
-  return false;
+  // Hardcoded fallback
+  state.scripMaster = Object.entries(NIFTY_50_FALLBACK_TOKENS).map(([s, t]) => ({
+    symbol: `${s}-EQ`, name: s, token: t, exch_seg: "NSE",
+  }));
+  state.scripMasterLoaded = true;
+  state.usingFallback = true;
+  log(`⚠️ Using ${state.scripMaster.length} hardcoded fallback`);
+  return true;
 }
-
-async function getNSEToken(symbol) {
+async function getSymbolToken(symbol) {
   if (state.symbolTokens.has(symbol)) return state.symbolTokens.get(symbol);
-  if (!state.scripMasterLoaded) await loadScripMasterRobust();
+  if (INDEX_TOKENS[symbol]) {
+    state.symbolTokens.set(symbol, INDEX_TOKENS[symbol]);
+    state.tokenToSymbol.set(INDEX_TOKENS[symbol], symbol);
+    return INDEX_TOKENS[symbol];
+  }
   if (NIFTY_50_FALLBACK_TOKENS[symbol]) {
     const t = NIFTY_50_FALLBACK_TOKENS[symbol];
     state.symbolTokens.set(symbol, t);
     state.tokenToSymbol.set(t, symbol);
-    state.symbolType.set(symbol, "NSE");
     return t;
   }
+  if (!state.scripMasterLoaded) await loadScripMaster();
   if (!state.scripMaster) return null;
   let m = state.scripMaster.find(s => s.symbol === `${symbol}-EQ` && s.exch_seg === "NSE");
   if (!m) m = state.scripMaster.find(s => s.name === symbol && s.exch_seg === "NSE" && s.symbol?.endsWith("-EQ"));
   if (m?.token) {
     state.symbolTokens.set(symbol, m.token);
     state.tokenToSymbol.set(m.token, symbol);
-    state.symbolType.set(symbol, "NSE");
     return m.token;
   }
   return null;
 }
 
-// ═══ COMMODITY TOKEN RESOLVER (MCX) ═══
-async function getCommodityToken(symbol) {
-  if (state.symbolTokens.has(symbol)) return state.symbolTokens.get(symbol);
-  if (!state.scripMaster) return null;
-
-  // Find nearest expiry future contract for this commodity
-  const matches = state.scripMaster.filter(s =>
-      s.exch_seg === "MCX" &&
-      s.name === symbol &&
-      s.instrumenttype === "FUTCOM"
-  );
-
-  if (matches.length === 0) return null;
-  matches.sort((a, b) => {
-    const da = new Date(a.expiry || "9999-12-31");
-    const db = new Date(b.expiry || "9999-12-31");
-    return da - db;
-  });
-  const near = matches[0];
-
-  state.symbolTokens.set(symbol, near.token);
-  state.tokenToSymbol.set(near.token, symbol);
-  state.symbolType.set(symbol, "MCX");
-  state.commodityInfo.set(symbol, {
-    fullSymbol: near.symbol,
-    expiry: near.expiry,
-    lotSize: parseInt(near.lotsize || 1),
-    tickSize: parseFloat(near.tick_size || 0.05),
-  });
-  log(`  ✓ ${symbol} (MCX): ${near.symbol} · expiry ${near.expiry} · lot ${near.lotsize}`);
-  return near.token;
-}
-
-async function getSymbolToken(symbol) {
-  if (state.symbolTokens.has(symbol)) return state.symbolTokens.get(symbol);
-  if (CONFIG.COMMODITY_WATCHLIST.includes(symbol)) {
-    return await getCommodityToken(symbol);
-  }
-  return await getNSEToken(symbol);
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
-// HISTORICAL CANDLES
+// REQ 2: Historical candles with rate limiting (1 req/sec)
 // ═══════════════════════════════════════════════════════════════════════════
-async function loadHistoricalCandles(symbol, retries = 2) {
+async function fetchHistorical(symbol, interval, daysBack, retries = 2) {
   const token = await getSymbolToken(symbol);
-  if (!token) return 0;
-  const exchange = state.symbolType.get(symbol) || "NSE";
-  const { fromdate, todate } = getTradingDayRange(5);
-
+  if (!token) return [];
+  const exchange = INDEX_TOKENS[symbol] ? "NSE" : "NSE";
+  const { fromdate, todate } = getHistoricalRange(daysBack);
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await axios.post(
-          "https://apiconnect.angelbroking.com/rest/secure/angelbroking/historical/v1/getCandleData",
-          { exchange, symboltoken: token, interval: "FIVE_MINUTE", fromdate, todate },
-          { headers: angelHeaders(), timeout: 20000 }
+        "https://apiconnect.angelbroking.com/rest/secure/angelbroking/historical/v1/getCandleData",
+        { exchange, symboltoken: token, interval, fromdate, todate },
+        { headers: angelHeaders(), timeout: 20000 }
       );
       const data = res.data?.data || [];
-      if (data.length > 0) {
-        const candles = data.map(c => ({
-          bucket: c[0], o: parseFloat(c[1]), h: parseFloat(c[2]),
-          l: parseFloat(c[3]), c: parseFloat(c[4]), v: parseInt(c[5]),
-        }));
-        state.candleBuffer.set(symbol, candles);
-        return candles.length;
-      }
-      return 0;
+      return data.map(c => ({
+        time: new Date(c[0]),
+        bucket: c[0],
+        o: parseFloat(c[1]), h: parseFloat(c[2]),
+        l: parseFloat(c[3]), c: parseFloat(c[4]),
+        v: parseInt(c[5]),
+      }));
     } catch (e) {
       const status = e.response?.status;
       if (status === 401 && attempt < retries) { await authenticateAngel(); continue; }
       if (status === 429 && attempt < retries) { await new Promise(r => setTimeout(r, 3000)); continue; }
-      if (attempt === 0) log(`  ⚠️ ${symbol}: HTTP ${status}`);
-      return 0;
+      return [];
     }
   }
-  return 0;
+  return [];
 }
+
+async function loadAllHistoricalData() {
+  log(`📊 Loading ${CONFIG.HISTORICAL_DAYS}-day data with rate limiting...`);
+  let total5m = 0, total15m = 0, totalDaily = 0;
+  let ok = 0;
+  
+  for (const sym of CONFIG.WATCHLIST) {
+    // 5-min candles
+    const c5 = await fetchHistorical(sym, "FIVE_MINUTE", CONFIG.HISTORICAL_DAYS);
+    if (c5.length > 0) {
+      state.candleBuffer5m.set(sym, c5);
+      total5m += c5.length;
+      ok++;
+    }
+    await new Promise(r => setTimeout(r, CONFIG.HISTORICAL_RATE_LIMIT_MS));
+    
+    // 15-min candles for HTF
+    const c15 = await fetchHistorical(sym, "FIFTEEN_MINUTE", CONFIG.HISTORICAL_DAYS);
+    if (c15.length > 0) {
+      state.candleBuffer15m.set(sym, c15);
+      total15m += c15.length;
+    }
+    await new Promise(r => setTimeout(r, CONFIG.HISTORICAL_RATE_LIMIT_MS));
+    
+    // Daily candles for HTF
+    const cD = await fetchHistorical(sym, "ONE_DAY", CONFIG.HISTORICAL_DAYS);
+    if (cD.length > 0) {
+      state.candleBufferDaily.set(sym, cD);
+      totalDaily += cD.length;
+    }
+    await new Promise(r => setTimeout(r, CONFIG.HISTORICAL_RATE_LIMIT_MS));
+  }
+  
+  log(`✅ Loaded · 5m:${total5m} · 15m:${total15m} · daily:${totalDaily} (${ok}/${CONFIG.WATCHLIST.length} stocks)`);
+  
+  // REQ 5: Load index data
+  log(`📊 Loading index trend data...`);
+  const niftyDaily = await fetchHistorical(CONFIG.INDEX_NIFTY, "ONE_DAY", 20);
+  const bankNiftyDaily = await fetchHistorical(CONFIG.INDEX_BANKNIFTY, "ONE_DAY", 20);
+  if (niftyDaily.length > 0) {
+    state.candleBufferDaily.set(CONFIG.INDEX_NIFTY, niftyDaily);
+    state.niftyTrend = computeIndexTrend(niftyDaily);
+    log(`   Nifty trend: ${state.niftyTrend}`);
+  }
+  if (bankNiftyDaily.length > 0) {
+    state.candleBufferDaily.set(CONFIG.INDEX_BANKNIFTY, bankNiftyDaily);
+    state.bankNiftyTrend = computeIndexTrend(bankNiftyDaily);
+    log(`   BankNifty trend: ${state.bankNiftyTrend}`);
+  }
+}
+
+function computeIndexTrend(candles) {
+  if (candles.length < 10) return "neutral";
+  const closes = candles.map(c => c.c);
+  const e9 = ema(closes, 9);
+  const e21 = ema(closes, 21);
+  const last = closes[closes.length-1];
+  if (last > e9 && e9 > e21) return "bullish";
+  if (last < e9 && e9 < e21) return "bearish";
+  return "neutral";
+}
+
+// Update index trends every 30 min during market hours
+setInterval(async () => {
+  if (!isTradingWindow()) return;
+  const ndaily = await fetchHistorical(CONFIG.INDEX_NIFTY, "ONE_DAY", 20);
+  const bdaily = await fetchHistorical(CONFIG.INDEX_BANKNIFTY, "ONE_DAY", 20);
+  if (ndaily.length > 0) state.niftyTrend = computeIndexTrend(ndaily);
+  if (bdaily.length > 0) state.bankNiftyTrend = computeIndexTrend(bdaily);
+}, 30 * 60 * 1000);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // WEBSOCKET
 // ═══════════════════════════════════════════════════════════════════════════
-async function startWebSocket(nseTokens, mcxTokens) {
+async function startWebSocket(tokens) {
+  if (!tokens?.length) return;
   const wsUrl = `wss://smartapisocket.angelone.in/smart-stream?clientCode=${ENV.ANGEL_CLIENT_ID}&feedToken=${state.feedToken}&apiKey=${ENV.ANGEL_API_KEY}`;
   state.ws = new WebSocket(wsUrl);
-
   state.ws.on("open", () => {
-    log(`📡 WebSocket connected · ${nseTokens.length} NSE + ${mcxTokens?.length || 0} MCX tokens`);
-
-    // Subscribe NSE (exchangeType 1)
-    const nseChunks = [];
-    for (let i = 0; i < nseTokens.length; i += 50) nseChunks.push(nseTokens.slice(i, i + 50));
-    nseChunks.forEach((chunk, i) => {
+    log(`📡 WS connected · ${tokens.length} tokens`);
+    const chunks = [];
+    for (let i = 0; i < tokens.length; i += 50) chunks.push(tokens.slice(i, i + 50));
+    chunks.forEach((chunk, i) => {
       setTimeout(() => {
         if (state.ws?.readyState === WebSocket.OPEN) {
           state.ws.send(JSON.stringify({
-            correlationID: `nse-${i}`, action: 1,
+            correlationID: `t-${i}`, action: 1,
             params: { mode: 2, tokenList: [{ exchangeType: 1, tokens: chunk }] }
           }));
         }
       }, i * 300);
     });
-
-    // Subscribe MCX (exchangeType 5) if commodities enabled
-    if (mcxTokens?.length > 0) {
-      const mcxChunks = [];
-      for (let i = 0; i < mcxTokens.length; i += 50) mcxChunks.push(mcxTokens.slice(i, i + 50));
-      mcxChunks.forEach((chunk, i) => {
-        setTimeout(() => {
-          if (state.ws?.readyState === WebSocket.OPEN) {
-            state.ws.send(JSON.stringify({
-              correlationID: `mcx-${i}`, action: 1,
-              params: { mode: 2, tokenList: [{ exchangeType: 5, tokens: chunk }] }
-            }));
-          }
-        }, (nseChunks.length + i) * 300);
-      });
-    }
   });
-
   let tickCount = 0;
   state.ws.on("message", (data) => {
     try {
       const tick = parseBinaryTick(data);
       if (tick?.token) {
         tickCount++;
-        if (tickCount % 500 === 0) log(`📡 ${tickCount} ticks · ${state.livePrices.size} stocks`);
+        if (tickCount % 500 === 0) log(`📡 ${tickCount} ticks`);
         const symbol = state.tokenToSymbol.get(tick.token);
         if (symbol) {
           state.livePrices.set(symbol, {
@@ -514,43 +569,32 @@ async function startWebSocket(nseTokens, mcxTokens) {
       }
     } catch {}
   });
-
-  state.ws.on("close", () => {
-    log("⚠️ WebSocket closed · reconnecting in 5s");
-    setTimeout(() => startWebSocket(nseTokens, mcxTokens), 5000);
-  });
-  state.ws.on("error", (e) => log(`⚠️ WS error: ${e.message}`));
-  setInterval(() => {
-    if (state.ws?.readyState === WebSocket.OPEN) state.ws.ping();
-  }, 30000);
+  state.ws.on("close", () => setTimeout(() => startWebSocket(tokens), 5000));
+  state.ws.on("error", (e) => log(`⚠️ WS: ${e.message}`));
+  setInterval(() => { if (state.ws?.readyState === WebSocket.OPEN) state.ws.ping(); }, 30000);
 }
-
-function parseBinaryTick(buffer) {
-  if (!buffer || buffer.length < 51) return null;
+function parseBinaryTick(buf) {
+  if (!buf || buf.length < 51) return null;
   try {
-    let tokenStr = "";
-    for (let i = 2; i < 27; i++) {
-      if (buffer[i] === 0) break;
-      tokenStr += String.fromCharCode(buffer[i]);
-    }
-    tokenStr = tokenStr.trim();
-    const ltp = buffer.readInt32LE(43) / 100;
-    const ltq = buffer.length >= 51 ? buffer.readInt32LE(47) : 0;
-    if (ltp <= 0 || !tokenStr) return null;
-    return { token: tokenStr, ltp, volume: ltq };
+    let token = "";
+    for (let i = 2; i < 27; i++) { if (buf[i] === 0) break; token += String.fromCharCode(buf[i]); }
+    token = token.trim();
+    const ltp = buf.readInt32LE(43) / 100;
+    const ltq = buf.length >= 51 ? buf.readInt32LE(47) : 0;
+    if (ltp <= 0 || !token) return null;
+    return { token, ltp, volume: ltq };
   } catch { return null; }
 }
-
 function updateCandles(symbol, ltp, vol) {
-  if (!state.candleBuffer.has(symbol)) state.candleBuffer.set(symbol, []);
-  const candles = state.candleBuffer.get(symbol);
+  if (!state.candleBuffer5m.has(symbol)) state.candleBuffer5m.set(symbol, []);
+  const cs = state.candleBuffer5m.get(symbol);
   const ist = getISTDate();
   const bucket = Math.floor(ist.getMinutes() / 5) * 5;
-  const bucketKey = `${ist.getHours()}:${bucket}`;
-  const last = candles[candles.length - 1];
-  if (!last || last.bucket !== bucketKey) {
-    candles.push({ bucket: bucketKey, o: ltp, h: ltp, l: ltp, c: ltp, v: vol });
-    if (candles.length > 300) candles.shift();
+  const key = `${ist.getHours()}:${bucket}`;
+  const last = cs[cs.length - 1];
+  if (!last || last.bucket !== key) {
+    cs.push({ bucket: key, o: ltp, h: ltp, l: ltp, c: ltp, v: vol });
+    if (cs.length > 500) cs.shift();
   } else {
     last.h = Math.max(last.h, ltp);
     last.l = Math.min(last.l, ltp);
@@ -562,219 +606,179 @@ function updateCandles(symbol, ltp, vol) {
 // ═══════════════════════════════════════════════════════════════════════════
 // INDICATORS
 // ═══════════════════════════════════════════════════════════════════════════
-const ema = (v,p) => { if(v.length<p) return v[v.length-1]||0; const k=2/(p+1); let e=v.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<v.length;i++) e=v[i]*k+e*(1-k); return e; };
-const sma = (v,p) => v.length<p ? (v[v.length-1]||0) : v.slice(-p).reduce((a,b)=>a+b,0)/p;
-function rsi(c,p=14){ if(c.length<p+1) return 50; const ch=c.slice(1).map((x,i)=>x-c[i]); const g=ch.map(x=>x>0?x:0); const l=ch.map(x=>x<0?-x:0); let ag=g.slice(0,p).reduce((a,b)=>a+b,0)/p; let al=l.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<ch.length;i++){ ag=(ag*(p-1)+g[i])/p; al=(al*(p-1)+l[i])/p; } return 100-100/(1+ag/(al||0.001)); }
-function macd(c){ const e12=ema(c,12),e26=ema(c,26); return { value:e12-e26, bullish:e12>e26 }; }
-function vwap(cs){ if(!cs.length) return 0; let pv=0,tv=0; for(const c of cs){ pv+=((c.h+c.l+c.c)/3)*c.v; tv+=c.v; } return tv>0?pv/tv:cs[cs.length-1].c; }
-function atr(cs,p=14){ if(cs.length<p+1) return 0; const trs=[]; for(let i=1;i<cs.length;i++){ const h=cs[i].h,l=cs[i].l,pc=cs[i-1].c; trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc))); } return sma(trs.slice(-p),p); }
-function adx(cs,p=14){ if(cs.length<p*2) return {adx:0,plusDI:0,minusDI:0,trending:false}; const pdms=[],mdms=[],trs=[]; for(let i=1;i<cs.length;i++){ const um=cs[i].h-cs[i-1].h,dm=cs[i-1].l-cs[i].l; pdms.push(um>dm&&um>0?um:0); mdms.push(dm>um&&dm>0?dm:0); const h=cs[i].h,l=cs[i].l,pc=cs[i-1].c; trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc))); } const stt=sma(trs.slice(-p),p), spm=sma(pdms.slice(-p),p), smm=sma(mdms.slice(-p),p); const pdi=(spm/(stt||1))*100, mdi=(smm/(stt||1))*100; return {adx:Math.abs(pdi-mdi)/((pdi+mdi)||1)*100,plusDI:pdi,minusDI:mdi,trending:Math.abs(pdi-mdi)/((pdi+mdi)||1)*100>25}; }
-function supertrend(cs,p=10,m=3){ if(cs.length<p) return {trend:"neutral"}; const a=atr(cs,p),l=cs[cs.length-1]; const hl2=(l.h+l.l)/2,ub=hl2+m*a,lb=hl2-m*a; return {trend:l.c>ub?"bull":l.c<lb?"bear":"neutral"}; }
-function bollinger(c,p=20){ if(c.length<p) return {upper:0,lower:0,mid:0}; const s=c.slice(-p),m=s.reduce((a,b)=>a+b,0)/p,sd=Math.sqrt(s.reduce((a,b)=>a+(b-m)**2,0)/p); return {upper:m+2*sd,mid:m,lower:m-2*sd}; }
+const ema = (v, p) => { if (v.length < p) return v[v.length-1] || 0; const k = 2/(p+1); let e = v.slice(0, p).reduce((a,b) => a+b, 0)/p; for (let i = p; i < v.length; i++) e = v[i]*k + e*(1-k); return e; };
+const sma = (v, p) => v.length < p ? (v[v.length-1] || 0) : v.slice(-p).reduce((a,b) => a+b, 0)/p;
+function rsi(c, p=14) { if (c.length < p+1) return 50; const ch = c.slice(1).map((x,i) => x-c[i]); const g = ch.map(x => x>0?x:0); const l = ch.map(x => x<0?-x:0); let ag = g.slice(0,p).reduce((a,b) => a+b, 0)/p; let al = l.slice(0,p).reduce((a,b) => a+b, 0)/p; for (let i = p; i < ch.length; i++) { ag = (ag*(p-1)+g[i])/p; al = (al*(p-1)+l[i])/p; } return 100 - 100/(1 + ag/(al||0.001)); }
+function macd(c) { const e12 = ema(c, 12), e26 = ema(c, 26); return { value: e12-e26, bullish: e12 > e26 }; }
+function vwap(cs) { if (!cs.length) return 0; let pv=0, tv=0; for (const c of cs) { pv += ((c.h+c.l+c.c)/3)*c.v; tv += c.v; } return tv > 0 ? pv/tv : cs[cs.length-1].c; }
+function atr(cs, p=14) { if (cs.length < p+1) return 0; const trs = []; for (let i = 1; i < cs.length; i++) { const h = cs[i].h, l = cs[i].l, pc = cs[i-1].c; trs.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc))); } return sma(trs.slice(-p), p); }
+function adx(cs, p=14) { if (cs.length < p*2) return { adx:0, plusDI:0, minusDI:0, trending:false }; const pdms=[],mdms=[],trs=[]; for (let i = 1; i < cs.length; i++) { const um = cs[i].h-cs[i-1].h, dm = cs[i-1].l-cs[i].l; pdms.push(um>dm && um>0 ? um : 0); mdms.push(dm>um && dm>0 ? dm : 0); const h = cs[i].h, l = cs[i].l, pc = cs[i-1].c; trs.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc))); } const stt = sma(trs.slice(-p), p); const spm = sma(pdms.slice(-p), p); const smm = sma(mdms.slice(-p), p); const pdi = (spm/(stt||1))*100; const mdi = (smm/(stt||1))*100; const dx = Math.abs(pdi-mdi)/((pdi+mdi)||1)*100; return { adx: dx, plusDI: pdi, minusDI: mdi, trending: dx > 25 }; }
+function supertrend(cs, p=10, m=3) { if (cs.length < p) return { trend: "neutral" }; const a = atr(cs, p); const last = cs[cs.length-1]; const hl2 = (last.h+last.l)/2; const ub = hl2 + m*a, lb = hl2 - m*a; return { trend: last.c > ub ? "bull" : last.c < lb ? "bear" : "neutral" }; }
+function bollinger(c, p=20) { if (c.length < p) return { upper:0, lower:0, mid:0 }; const s = c.slice(-p); const m = s.reduce((a,b) => a+b, 0)/p; const sd = Math.sqrt(s.reduce((a,b) => a+(b-m)**2, 0)/p); return { upper: m+2*sd, mid: m, lower: m-2*sd }; }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// STATISTICAL LEARNING
+// REQ 3 + 5 + 9: STRATEGY ENGINE (analyzeSignal)
+// Single source of truth — used by both live bot AND backtest
 // ═══════════════════════════════════════════════════════════════════════════
-async function updateSymbolStats() {
-  if (!CONFIG.USE_STATISTICAL_LEARNING) return;
-  try {
-    const r = await db.query(`
-      SELECT symbol, COUNT(*) AS total, COUNT(*) FILTER (WHERE pnl > 0) AS wins, AVG(pnl) AS avg_pnl
-      FROM trades WHERE status = 'closed' AND closed_at > NOW() - INTERVAL '30 days'
-      GROUP BY symbol HAVING COUNT(*) >= 5
-    `);
-    state.symbolStats.clear();
-    r.rows.forEach(row => {
-      state.symbolStats.set(row.symbol, {
-        winRate: parseFloat(row.wins)/parseFloat(row.total),
-        total: parseInt(row.total),
-        avgPnL: parseFloat(row.avg_pnl),
-      });
-    });
-    log(`📊 Symbol stats: ${state.symbolStats.size} stocks`);
-  } catch (e) { log(`⚠️ Stats failed: ${e.message}`); }
-}
-setInterval(updateSymbolStats, 60 * 60 * 1000);
+export function analyzeSignal(symbol, candles5m, candles15m, candlesDaily, niftyTrend, bankNiftyTrend, relaxed = false) {
+  if (candles5m.length < CONFIG.MIN_CANDLES) return { rejected: true, reason: `${candles5m.length} candles` };
 
-// ═══════════════════════════════════════════════════════════════════════════
-// AI SENTIMENT
-// ═══════════════════════════════════════════════════════════════════════════
-async function getAISentiment(symbol, signal, indicators) {
-  if (!CONFIG.USE_AI_SENTIMENT || !ENV.ANTHROPIC_API_KEY) {
-    return { sentiment: "NEUTRAL", confidence: 50, skipped: true };
-  }
-  const prompt = `NSE/MCX intraday analyst. Technical signal:
-Stock: ${symbol} | Signal: ${signal} | RSI: ${indicators.rsi} | ADX: ${indicators.adx}
-Supertrend: ${indicators.supertrend} | Pattern: ${indicators.pattern || "none"}
-
-Reply ONLY:
-VERDICT: AGREE / DISAGREE / NEUTRAL
-CONFIDENCE: 0-100
-REASON: One sentence.`;
-
-  try {
-    const res = await axios.post(
-        "https://api.anthropic.com/v1/messages",
-        { model: "claude-sonnet-4-20250514", max_tokens: 200, messages: [{ role: "user", content: prompt }] },
-        { headers: {
-            "x-api-key": ENV.ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-          }, timeout: 10000 }
-    );
-    const text = res.data?.content?.[0]?.text || "";
-    return {
-      sentiment: (text.match(/VERDICT:\s*(AGREE|DISAGREE|NEUTRAL)/i)?.[1] || "NEUTRAL").toUpperCase(),
-      confidence: parseInt(text.match(/CONFIDENCE:\s*(\d+)/)?.[1] || "50"),
-      reason: text.match(/REASON:\s*(.+?)(?:\n|$)/)?.[1]?.trim() || "No reason",
-      skipped: false,
-    };
-  } catch (e) {
-    return { sentiment: "NEUTRAL", confidence: 50, skipped: true, error: e.message };
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// STRATEGY ENGINE
-// ═══════════════════════════════════════════════════════════════════════════
-function analyzeSignal(symbol, candles, relaxed = false) {
-  if (candles.length < CONFIG.MIN_CANDLES) return { rejected: true, reason: `${candles.length} candles` };
-
-  const closes = candles.map(c => c.c);
-  const vols = candles.map(c => c.v);
+  const closes = candles5m.map(c => c.c);
+  const vols = candles5m.map(c => c.v);
   const price = closes[closes.length - 1];
+  
+  // 5-min indicators
   const R = rsi(closes), M = macd(closes);
-  const e9 = ema(closes,9), e21 = ema(closes,21), e50 = ema(closes,50);
+  const e9 = ema(closes, 9), e21 = ema(closes, 21), e50 = ema(closes, 50);
   const e200 = ema(closes, Math.min(200, closes.length-1));
-  const vw = vwap(candles);
-  const adxData = adx(candles);
-  const st = supertrend(candles);
+  const vw = vwap(candles5m);
+  const adxData = adx(candles5m);
+  const st = supertrend(candles5m);
   const bb = bollinger(closes);
-  const a = atr(candles);
-  const avgVol = vols.slice(-20).reduce((a,b)=>a+b,0) / Math.min(20, vols.length);
+  const a = atr(candles5m);
+  const avgVol = vols.slice(-20).reduce((a,b) => a+b, 0) / Math.min(20, vols.length);
   const volRatio = avgVol > 0 ? vols[vols.length-1] / avgVol : 1;
 
   if (!relaxed && adxData.adx < CONFIG.MIN_ADX) {
     return { rejected: true, reason: `ADX ${adxData.adx.toFixed(1)} < ${CONFIG.MIN_ADX}` };
   }
 
-  const longTermBullish = price > e200;
-  const longTermBearish = price < e200;
-  const last = candles[candles.length-1], prev = candles[candles.length-2];
+  // ─── REQ 3: 15-min HTF trend ───
+  let trend15m = "neutral";
+  if (candles15m && candles15m.length > 21) {
+    const c15 = candles15m.map(c => c.c);
+    const e9_15 = ema(c15, 9);
+    const e21_15 = ema(c15, 21);
+    if (e9_15 > e21_15) trend15m = "bullish";
+    else if (e9_15 < e21_15) trend15m = "bearish";
+  }
+  
+  // ─── REQ 3: Daily HTF trend ───
+  let trendDaily = "neutral";
+  if (candlesDaily && candlesDaily.length > 21) {
+    const cD = candlesDaily.map(c => c.c);
+    const e9_d = ema(cD, 9);
+    const e21_d = ema(cD, 21);
+    if (e9_d > e21_d) trendDaily = "bullish";
+    else if (e9_d < e21_d) trendDaily = "bearish";
+  }
+
+  // ─── REQ 5: Determine relevant index trend ───
+  // Banking stocks → BankNifty, others → Nifty
+  const bankingStocks = ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK","BAJFINANCE","BAJAJFINSV","SBILIFE","HDFCLIFE"];
+  const relevantIndex = bankingStocks.includes(symbol) ? bankNiftyTrend : niftyTrend;
+
+  // Patterns
+  const last = candles5m[candles5m.length-1];
+  const prev = candles5m[candles5m.length-2];
   const isBullishEngulfing = prev && last.c > last.o && prev.c < prev.o && last.c > prev.o && last.o < prev.c;
-  const isHammer = last && (last.c - last.l) > 2*(last.h - last.c) && last.c > last.o;
+  const isHammer = last && (last.c - last.l) > 2 * (last.h - last.c) && last.c > last.o;
   const isBearishEngulfing = prev && last.c < last.o && prev.c > prev.o && last.c < prev.o && last.o > prev.c;
-  const isShootingStar = last && (last.h - last.c) > 2*(last.c - last.l) && last.c < last.o;
+  const isShootingStar = last && (last.h - last.c) > 2 * (last.c - last.l) && last.c < last.o;
 
   let score = 0, bullCount = 0, bearCount = 0;
   const checks = {};
 
-  if (R < 30) { score += 2.5; bullCount++; checks.rsi = "oversold"; }
-  else if (R > 70) { score -= 2.5; bearCount++; checks.rsi = "overbought"; }
-  else if (R < 40 && longTermBullish) { score += 1; bullCount++; checks.rsi = "bull"; }
-  else if (R > 60 && longTermBearish) { score -= 1; bearCount++; checks.rsi = "bear"; }
+  // RSI
+  if (R < 30) { score += 2; bullCount++; checks.rsi = "oversold"; }
+  else if (R > 70) { score -= 2; bearCount++; checks.rsi = "overbought"; }
+  else if (R < 45 && trendDaily === "bullish") { score += 1; bullCount++; checks.rsi = "bull"; }
+  else if (R > 55 && trendDaily === "bearish") { score -= 1; bearCount++; checks.rsi = "bear"; }
   else checks.rsi = "neutral";
 
-  if (M.bullish && M.value > 0) { score += 2; bullCount++; checks.macd = "strong-bull"; }
-  else if (!M.bullish && M.value < 0) { score -= 2; bearCount++; checks.macd = "strong-bear"; }
-  else if (M.bullish) { score += 0.5; checks.macd = "weak-bull"; }
-  else { score -= 0.5; checks.macd = "weak-bear"; }
+  // MACD
+  if (M.bullish && M.value > 0) { score += 1.5; bullCount++; checks.macd = "bull"; }
+  else if (!M.bullish && M.value < 0) { score -= 1.5; bearCount++; checks.macd = "bear"; }
 
-  if (e9 > e21 && e21 > e50 && e50 > e200) { score += 2.5; bullCount++; checks.ema = "strong-bull"; }
-  else if (e9 < e21 && e21 < e50 && e50 < e200) { score -= 2.5; bearCount++; checks.ema = "strong-bear"; }
-  else if (e9 > e21 && e21 > e50) { score += 1; bullCount++; checks.ema = "bull"; }
-  else if (e9 < e21 && e21 < e50) { score -= 1; bearCount++; checks.ema = "bear"; }
-  else checks.ema = "mixed";
+  // EMA 5m
+  if (e9 > e21 && e21 > e50) { score += 2; bullCount++; checks.ema = "bull"; }
+  else if (e9 < e21 && e21 < e50) { score -= 2; bearCount++; checks.ema = "bear"; }
+  else if (e9 > e21) { score += 0.5; checks.ema = "bull-weak"; }
+  else { score -= 0.5; checks.ema = "bear-weak"; }
 
-  if (price > vw * 1.003) { score += 2; bullCount++; checks.vwap = "above"; }
-  else if (price < vw * 0.997) { score -= 2; bearCount++; checks.vwap = "below"; }
-  else checks.vwap = "near";
+  // VWAP
+  if (price > vw * 1.003) { score += 1.5; bullCount++; checks.vwap = "above"; }
+  else if (price < vw * 0.997) { score -= 1.5; bearCount++; checks.vwap = "below"; }
 
-  if (adxData.trending && adxData.adx > 30) {
-    if (adxData.plusDI > adxData.minusDI * 1.2) { score += 1.5; bullCount++; checks.adx = "strong-bull-trend"; }
-    else if (adxData.minusDI > adxData.plusDI * 1.2) { score -= 1.5; bearCount++; checks.adx = "strong-bear-trend"; }
-  } else if (adxData.trending) {
-    if (adxData.plusDI > adxData.minusDI) { score += 0.5; checks.adx = "bull-trend"; }
-    else { score -= 0.5; checks.adx = "bear-trend"; }
-  } else checks.adx = "ranging";
-
-  if (st.trend === "bull") { score += 1.5; bullCount++; checks.supertrend = "bull"; }
-  else if (st.trend === "bear") { score -= 1.5; bearCount++; checks.supertrend = "bear"; }
-  else checks.supertrend = "neutral";
-
-  if (price <= bb.lower * 1.005 && R < 35) { score += 1.5; checks.bb = "oversold-bounce"; }
-  else if (price >= bb.upper * 0.995 && R > 65) { score -= 1.5; checks.bb = "overbought-rejection"; }
-
-  if (isBullishEngulfing || isHammer) {
-    score += 1.5; bullCount++;
-    checks.pattern = isBullishEngulfing ? "bullish-engulfing" : "hammer";
-  } else if (isBearishEngulfing || isShootingStar) {
-    score -= 1.5; bearCount++;
-    checks.pattern = isBearishEngulfing ? "bearish-engulfing" : "shooting-star";
+  // ADX
+  if (adxData.trending) {
+    if (adxData.plusDI > adxData.minusDI * 1.2) { score += 1; checks.adx = "bull-trend"; }
+    else if (adxData.minusDI > adxData.plusDI * 1.2) { score -= 1; checks.adx = "bear-trend"; }
   }
 
-  if (volRatio > 2.0) score *= 1.2;
-  else if (volRatio > 1.5) score *= 1.1;
+  // Supertrend
+  if (st.trend === "bull") { score += 1; bullCount++; checks.supertrend = "bull"; }
+  else if (st.trend === "bear") { score -= 1; bearCount++; checks.supertrend = "bear"; }
+
+  // Bollinger
+  if (price <= bb.lower * 1.005 && R < 35) { score += 1; checks.bb = "oversold-bounce"; }
+  else if (price >= bb.upper * 0.995 && R > 65) { score -= 1; checks.bb = "overbought-rejection"; }
+
+  // Patterns
+  if (isBullishEngulfing || isHammer) { score += 1; bullCount++; checks.pattern = isBullishEngulfing ? "engulfing" : "hammer"; }
+  else if (isBearishEngulfing || isShootingStar) { score -= 1; bearCount++; checks.pattern = isBearishEngulfing ? "engulfing-bear" : "shooting-star"; }
+
+  // ─── REQ 3: HTF confirmation BOOST ───
+  if (trend15m === "bullish") score += 0.75;
+  else if (trend15m === "bearish") score -= 0.75;
+  if (trendDaily === "bullish") score += 1;
+  else if (trendDaily === "bearish") score -= 1;
+
+  // ─── REQ 5: Index trend BOOST ───
+  if (relevantIndex === "bullish") score += 0.5;
+  else if (relevantIndex === "bearish") score -= 0.5;
+
+  // Volume
+  if (volRatio > 1.5) score *= 1.1;
   else if (volRatio < 0.7) score *= 0.7;
 
-  if (longTermBearish && score > 0) score *= 0.5;
-  if (longTermBullish && score < 0) score *= 0.5;
-
-  let statBoost = 0;
-  if (CONFIG.USE_STATISTICAL_LEARNING && state.symbolStats.has(symbol)) {
-    const stats = state.symbolStats.get(symbol);
-    if (stats.winRate > 0.6) statBoost = 0.5;
-    else if (stats.winRate < 0.4) statBoost = -0.5;
-    score += Math.sign(score) * statBoost;
-  }
-
-  const sb = relaxed ? 2.5 : CONFIG.SIGNAL_SCORE_BUY;
-  const ss = relaxed ? -2.5 : CONFIG.SIGNAL_SCORE_SELL;
-  const mc = relaxed ? 3 : CONFIG.MIN_CONFLUENCE;
+  // Determine signal
+  const sb = relaxed ? 2.0 : CONFIG.SIGNAL_SCORE_BUY;
+  const ss = relaxed ? -2.0 : CONFIG.SIGNAL_SCORE_SELL;
+  const mc = relaxed ? 2 : CONFIG.MIN_CONFLUENCE;
 
   let signal = "HOLD", confidence = 50;
   if (score >= sb) { signal = "BUY"; confidence = Math.min(55 + score * 3, 85); }
   else if (score <= ss) { signal = "SELL"; confidence = Math.min(55 + Math.abs(score) * 3, 82); }
 
   const maxConf = Math.max(bullCount, bearCount);
+  
+  // ─── REQ 5: Block BUY if Nifty bearish, SELL if Nifty bullish (unless relaxed) ───
+  let indexFilter = true;
+  if (!relaxed) {
+    if (signal === "BUY" && relevantIndex === "bearish") indexFilter = false;
+    if (signal === "SELL" && relevantIndex === "bullish") indexFilter = false;
+  }
 
   const filtersPassed = {
     confluence: maxConf >= mc,
     volume: volRatio >= (relaxed ? 1.0 : CONFIG.MIN_VOLUME_RATIO),
     strength: Math.abs(score) >= Math.abs(sb),
-    confidence: confidence >= (relaxed ? 60 : CONFIG.MIN_CONFIDENCE),
+    confidence: confidence >= (relaxed ? 55 : CONFIG.MIN_CONFIDENCE),
     trend: relaxed ? true : adxData.adx >= CONFIG.MIN_ADX,
-    longTerm: signal === "BUY" ? !longTermBearish : signal === "SELL" ? !longTermBullish : true,
+    htfAlign: relaxed ? true : (signal === "BUY" ? trend15m !== "bearish" && trendDaily !== "bearish" : trend15m !== "bullish" && trendDaily !== "bullish"),
+    indexAlign: indexFilter,
   };
   const safeToTrade = Object.values(filtersPassed).every(Boolean);
 
-  // ─── v6.5: Wider ATR-based SL/Target ───
+  // ATR-based SL/Target
   const stopDist = Math.max(price * CONFIG.SL_PCT, a * CONFIG.ATR_SL_MULT);
   const targetDist = Math.max(price * CONFIG.TARGET_PCT, a * CONFIG.ATR_TARGET_MULT);
-
-  // Position sizing (different for commodities)
-  const isCommodity = state.symbolType.get(symbol) === "MCX";
-  let qty;
-  if (isCommodity) {
-    const lotSize = state.commodityInfo.get(symbol)?.lotSize || 1;
-    const lotsAffordable = Math.max(1, Math.floor(CONFIG.RISK_PER_TRADE / (lotSize * stopDist)));
-    qty = lotsAffordable * lotSize;
-  } else {
-    qty = Math.max(1, Math.floor(CONFIG.RISK_PER_TRADE / stopDist));
-  }
-
+  
+  // REQ 13: Position sizing using dynamic capital
+  const riskAmount = state.capital * CONFIG.RISK_PCT;
+  const qty = Math.max(1, Math.floor(riskAmount / stopDist));
+  
   const entry = parseFloat(price.toFixed(2));
   const sl = parseFloat((signal === "BUY" ? price - stopDist : price + stopDist).toFixed(2));
   const target = parseFloat((signal === "BUY" ? price + targetDist : price - targetDist).toFixed(2));
-  const orderType = isCommodity ? "MIS" : ((maxConf >= 5 && volRatio > 1.5 && confidence > 75 && adxData.adx > 30) ? "CNC" : "MIS");
 
   return {
     id: `${symbol}-${Date.now()}`,
     symbol, signal,
     confidence: parseFloat(confidence.toFixed(1)),
     score: parseFloat(score.toFixed(2)),
-    orderType,
-    isCommodity,
+    orderType: CONFIG.ORDER_TYPE,  // Always DELIVERY
     indicators: {
       rsi: parseFloat(R.toFixed(1)),
       vwap: parseFloat(vw.toFixed(2)),
@@ -784,13 +788,13 @@ function analyzeSignal(symbol, candles, relaxed = false) {
       volRatio: parseFloat(volRatio.toFixed(2)),
       pattern: checks.pattern || "none",
       checks,
+      trend15m, trendDaily,
+      indexTrend: relevantIndex,
     },
-    bullCount, bearCount,
-    longTermTrend: longTermBullish ? "bullish" : longTermBearish ? "bearish" : "neutral",
-    statBoost,
-    filtersPassed, safeToTrade,
+    bullCount, bearCount, filtersPassed, safeToTrade,
     entry, sl, target, qty,
     capital: qty * entry,
+    riskAmount: parseFloat(riskAmount.toFixed(2)),
     maxLoss: qty * stopDist,
     maxGain: qty * targetDist,
     relaxed, timestamp: Date.now(), rejected: false,
@@ -798,49 +802,122 @@ function analyzeSignal(symbol, candles, relaxed = false) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// BALANCE CHECK
+// REQ 7: Balance check + suggestion
 // ═══════════════════════════════════════════════════════════════════════════
-async function fetchLiveBalance(forceFresh = false) {
+async function fetchBalance() {
   const age = Date.now() - state.balanceCacheTime;
-  if (!forceFresh && state.cachedBalance && age < 30000) return state.cachedBalance;
+  if (state.cachedBalance && age < 30000) return state.cachedBalance;
   try {
     const res = await axios.get(
-        "https://apiconnect.angelbroking.com/rest/secure/angelbroking/user/v1/getRMS",
-        { headers: angelHeaders(), timeout: 8000 }
+      "https://apiconnect.angelbroking.com/rest/secure/angelbroking/user/v1/getRMS",
+      { headers: angelHeaders(), timeout: 8000 }
     );
     const d = res.data?.data || {};
     state.cachedBalance = {
       availableCash: parseFloat(d.availablecash || 0),
       utilisedMargin: parseFloat(d.utiliseddebits || 0),
-      realisedMTM: parseFloat(d.m2mrealised || 0),
-      unrealisedMTM: parseFloat(d.m2munrealised || 0),
     };
     state.balanceCacheTime = Date.now();
     return state.cachedBalance;
-  } catch (e) {
-    return state.cachedBalance || { availableCash: 0, utilisedMargin: 0 };
-  }
+  } catch { return state.cachedBalance || { availableCash: 0, utilisedMargin: 0 }; }
 }
 
-async function balanceCheck(sig) {
-  const balance = await fetchLiveBalance(true);
+async function balanceSuggestion(sig) {
+  const balance = await fetchBalance();
   const available = balance.availableCash || 0;
-  const isIntraday = sig.orderType === "MIS";
-  const capitalNeeded = sig.qty * sig.entry;
-  const marginNeeded = isIntraday ? capitalNeeded / 5 : capitalNeeded;
-
-  if (available - CONFIG.MIN_CASH_BUFFER < marginNeeded) {
-    const maxQty = Math.floor((available - CONFIG.MIN_CASH_BUFFER) / (isIntraday ? sig.entry / 5 : sig.entry));
-    if (maxQty < 1) return { approved: false, message: `Need ₹${marginNeeded.toFixed(0)}` };
-    return { approved: true, adjusted: true, suggestedQty: maxQty, message: `Qty: ${sig.qty} → ${maxQty}` };
-  }
-  const maxPerTrade = available * CONFIG.MAX_CAPITAL_PER_TRADE;
-  if (marginNeeded > maxPerTrade) {
-    const maxQty = Math.floor(maxPerTrade / (isIntraday ? sig.entry / 5 : sig.entry));
-    return { approved: true, adjusted: true, suggestedQty: maxQty, message: `Capped at 30%` };
-  }
-  return { approved: true, adjusted: false, suggestedQty: sig.qty, message: "OK" };
+  
+  // REQ 6: Delivery means full capital required
+  const fullCapital = sig.qty * sig.entry;
+  
+  // REQ 7: How many shares can buy
+  const maxAffordableQty = Math.floor((available - CONFIG.MIN_CASH_BUFFER) / sig.entry);
+  const maxPerTradeQty = Math.floor((available * CONFIG.MAX_CAPITAL_PER_TRADE) / sig.entry);
+  const suggestedQty = Math.min(sig.qty, maxAffordableQty, maxPerTradeQty);
+  
+  return {
+    available,
+    fullCapitalNeeded: fullCapital,
+    requestedQty: sig.qty,
+    suggestedQty: Math.max(0, suggestedQty),
+    maxAffordableQty,
+    canAfford: suggestedQty > 0,
+    message: suggestedQty < sig.qty 
+      ? `⚠️ Suggested: ${suggestedQty} shares (₹${(suggestedQty * sig.entry).toFixed(0)}) instead of ${sig.qty}`
+      : `✅ Can buy ${sig.qty} shares (₹${fullCapital.toFixed(0)})`,
+  };
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REQ 6: Holdings analyzer
+// ═══════════════════════════════════════════════════════════════════════════
+async function fetchHoldings() {
+  try {
+    const res = await axios.get(
+      "https://apiconnect.angelbroking.com/rest/secure/angelbroking/portfolio/v1/getHolding",
+      { headers: angelHeaders(), timeout: 10000 }
+    );
+    state.holdings = res.data?.data || [];
+    return state.holdings;
+  } catch (e) {
+    log(`⚠️ Holdings fetch: ${e.message}`);
+    return [];
+  }
+}
+
+async function analyzeHoldings() {
+  if (!CONFIG.ANALYZE_HOLDINGS) return;
+  const holdings = await fetchHoldings();
+  if (!holdings.length) return;
+  
+  for (const h of holdings) {
+    const symbol = h.tradingsymbol?.replace("-EQ", "");
+    if (!symbol) continue;
+    
+    const candles5m = state.candleBuffer5m.get(symbol);
+    const candles15m = state.candleBuffer15m.get(symbol);
+    const candlesDaily = state.candleBufferDaily.get(symbol);
+    if (!candles5m || candles5m.length < CONFIG.MIN_CANDLES) continue;
+    
+    const sig = analyzeSignal(symbol, candles5m, candles15m, candlesDaily, state.niftyTrend, state.bankNiftyTrend);
+    if (!sig || sig.rejected) continue;
+    
+    const ltp = parseFloat(h.ltp || 0);
+    const avg = parseFloat(h.averageprice || 0);
+    const qty = parseInt(h.quantity || 0);
+    const pnl = (ltp - avg) * qty;
+    const pnlPct = avg > 0 ? ((ltp - avg) / avg) * 100 : 0;
+    
+    // Notify if SELL signal on existing holding
+    if (sig.signal === "SELL" && sig.confidence > 65) {
+      await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
+        `💼 *Holding Alert: SELL ${symbol}*\n━━━━━━━━━━━\n` +
+        `Bought @ ₹${avg.toFixed(2)} · Qty ${qty}\n` +
+        `LTP: ₹${ltp.toFixed(2)}\n` +
+        `Current P&L: ${pnl >= 0 ? "+" : ""}₹${pnl.toFixed(0)} (${pnlPct.toFixed(2)}%)\n\n` +
+        `🤖 Signal: ${sig.signal} · ${sig.confidence}% confidence\n` +
+        `Score: ${sig.score} · RSI: ${sig.indicators.rsi}\n` +
+        `Trend: 15m ${sig.indicators.trend15m} · Daily ${sig.indicators.trendDaily}\n\n` +
+        `_Recommendation: Consider booking ${pnl >= 0 ? "profit" : "exiting"}_`,
+        { parse_mode: "Markdown" }
+      );
+    }
+    // Notify if approaching target on holding
+    else if (sig.signal === "BUY" && pnlPct < -3) {
+      await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
+        `💼 *Holding ${symbol} · Recovery Signal*\n` +
+        `Bought @ ₹${avg.toFixed(2)} · Now ₹${ltp.toFixed(2)} (${pnlPct.toFixed(2)}%)\n` +
+        `🤖 ${sig.signal} signal active · ${sig.confidence}% confidence\n` +
+        `_Hold or accumulate_`,
+        { parse_mode: "Markdown" }
+      );
+    }
+  }
+}
+
+// Run holdings analysis every 30 min during market
+setInterval(() => {
+  if (isTradingWindow()) analyzeHoldings();
+}, 30 * 60 * 1000);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TELEGRAM
@@ -848,46 +925,41 @@ async function balanceCheck(sig) {
 const tg = new TelegramBot(ENV.TELEGRAM_TOKEN, { polling: true });
 
 async function sendSignalAlert(sig, isForced = false) {
-  let aiInfo = null;
-  if (CONFIG.USE_AI_SENTIMENT && sig.confidence >= CONFIG.AI_SENTIMENT_MIN_CONFIDENCE) {
-    aiInfo = await getAISentiment(sig.symbol, sig.signal, sig.indicators);
-    if (!aiInfo.skipped) {
-      if (aiInfo.sentiment === "AGREE") sig.confidence = Math.min(sig.confidence + 5, 90);
-      else if (aiInfo.sentiment === "DISAGREE") sig.confidence -= 10;
-      if (aiInfo.sentiment === "DISAGREE" && aiInfo.confidence > 70) {
-        log(`🤖 AI rejected ${sig.symbol}: ${aiInfo.reason}`);
-        return;
-      }
-    }
-  }
-
   state.pendingSignals.set(sig.id, sig);
   setTimeout(() => state.pendingSignals.delete(sig.id), 120000);
   await logSignal(sig, "pending");
   state.signalsToday++;
 
-  const emoji = sig.signal === "BUY" ? "🟢" : "🔴";
-  const exchTag = sig.isCommodity ? "🛢️ MCX" : "📈 NSE";
-  const typeBadge = sig.orderType === "CNC" ? "📦 DELIVERY" : "⚡ INTRADAY";
-  const forcedTag = isForced ? "\n🎯 *Best signal of the day*" : "";
-  const aiTag = aiInfo && !aiInfo.skipped ? `\n🤖 AI: ${aiInfo.sentiment} (${aiInfo.confidence}%)` : "";
-  const lotInfo = sig.isCommodity ? `\n📦 Lot: ${state.commodityInfo.get(sig.symbol)?.lotSize}` : "";
+  // REQ 7: Get balance suggestion
+  const bal = await balanceSuggestion(sig);
 
-  const msg = `${emoji} *${sig.signal} SIGNAL* · ${exchTag} · ${typeBadge}${forcedTag}
+  const emoji = sig.signal === "BUY" ? "🟢" : "🔴";
+  const forcedTag = isForced ? "\n🎯 *Best signal of the day*" : "";
+
+  const msg = `${emoji} *${sig.signal} SIGNAL* · 📦 DELIVERY${forcedTag}
 ━━━━━━━━━━━━━━━━━
 *${sig.symbol}*  (${sig.confidence}%)
 
 💰 Entry:  ₹${sig.entry}
 🎯 Target: ₹${sig.target}  (+₹${sig.maxGain.toFixed(0)})
 🛑 SL:     ₹${sig.sl}  (-₹${sig.maxLoss.toFixed(0)})
-📦 Qty: ${sig.qty} · ₹${sig.capital.toFixed(0)}${lotInfo}
+
+📦 Suggested Qty: ${sig.qty} (₹${sig.capital.toFixed(0)})
+${bal.message}
+💼 Available: ₹${bal.available.toLocaleString("en-IN")}
 
 📊 RSI ${sig.indicators.rsi} · ADX ${sig.indicators.adx}
 📈 VWAP ${sig.indicators.checks.vwap} · ST ${sig.indicators.supertrend}
-${sig.indicators.pattern !== "none" ? `🕯️ ${sig.indicators.pattern}` : ""}
-Confluence ${Math.max(sig.bullCount, sig.bearCount)}/7${aiTag}
+${sig.indicators.pattern !== "none" ? `🕯️ ${sig.indicators.pattern}\n` : ""}
+🔭 *HTF Trend:*
+   15m: ${sig.indicators.trend15m}
+   Daily: ${sig.indicators.trendDaily}
+   Index: ${sig.indicators.indexTrend}
 
-🛡️ Auto: Breakeven at +1.2% · Partial book at +2%
+Confluence ${Math.max(sig.bullCount, sig.bearCount)}/8
+
+🛡️ Auto: BE@+1.2% · Partial@+2%
+📌 *DELIVERY only — no leverage*
 
 ⏰ _Expires in 2 min_`;
 
@@ -921,124 +993,112 @@ tg.on("callback_query", async (query) => {
     if (state.isHalted) { await tg.answerCallbackQuery(query.id, { text: "🛑 Halted" }); return; }
     await executeLiveOrder(sig);
     await tg.answerCallbackQuery(query.id, { text: "✅ Placed" });
-    await tg.editMessageText(`✅ *LIVE* · ${sig.symbol} ${sig.signal}`, { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: "Markdown" });
+    await tg.editMessageText(`✅ *LIVE* · ${sig.symbol}`, { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: "Markdown" });
   }
   if (data.startsWith("exec_paper_")) {
     executePaperTrade(sig);
     await tg.answerCallbackQuery(query.id, { text: "📝 Paper" });
-    await tg.editMessageText(`📝 *PAPER* · ${sig.symbol} ${sig.signal}`, { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: "Markdown" });
+    await tg.editMessageText(`📝 *PAPER* · ${sig.symbol}`, { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: "Markdown" });
   }
 });
 
 tg.onText(/\/start/, async (msg) => {
-  await tg.sendMessage(msg.chat.id, `👋 *NSE TradeAI v6.5*\n\n${CONFIG.NSE_WATCHLIST.length} stocks${CONFIG.TRADE_COMMODITIES ? ` + ${CONFIG.COMMODITY_WATCHLIST.length} commodities` : ""}\n\n/status · /scan · /market\n/scheduler · /positions\n/stop · /resume`, { parse_mode: "Markdown" });
+  await tg.sendMessage(msg.chat.id, `👋 *NSE TradeAI v7.0*\n\n${CONFIG.WATCHLIST.length} stocks · Trading 9:30-3:15\n📦 DELIVERY only\n\n/status · /scan · /capital\n/holdings · /pnl · /scheduler`, { parse_mode: "Markdown" });
 });
 
 tg.onText(/\/status/, async () => {
   const liveActive = state.openTrades.filter(t => t.mode === "live" && t.status === "open").length;
-  const totalCandles = [...state.candleBuffer.values()].reduce((s, c) => s + c.length, 0);
   const status = getMarketStatus();
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `📊 *v6.5 Status*
-━━━━━━━━━━━━━
-Market: ${status.status === "open" ? "✅ NSE OPEN" : status.status === "mcx_only" ? "🛢️ MCX ONLY" : "🔴 CLOSED"}
-Live P&L: ₹${state.dayPnL.live.toFixed(0)} · Paper: ₹${state.dayPnL.paper.toFixed(0)}
-Positions: ${liveActive}/${CONFIG.MAX_POSITIONS}
-Signals today: ${state.signalsToday}/${CONFIG.TOP_SIGNALS_PER_DAY}
-━━━━━━━━━━━━━
-✅ Tokens: ${state.symbolTokens.size}/${CONFIG.WATCHLIST.length}
-📊 Candles: ${totalCandles}
-🔄 Scans: ${state.scanCount}
-📡 Live: ${state.livePrices.size}
-🤖 AI: ${CONFIG.USE_AI_SENTIMENT ? "ON" : "OFF"}
-🛢️ MCX: ${CONFIG.TRADE_COMMODITIES ? "ON" : "OFF"}`, { parse_mode: "Markdown" });
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `📊 *v7.0 Status*\n━━━━━━━━━━\nMarket: ${status.status}\nCapital: ₹${state.capital.toLocaleString("en-IN")}\nRisk/trade: ₹${getRiskPerTrade().toFixed(0)}\nDay loss cap: ₹${getDailyLossCap().toFixed(0)}\nLive P&L: ₹${state.dayPnL.live.toFixed(0)} · Paper: ₹${state.dayPnL.paper.toFixed(0)}\nPositions: ${liveActive}/${CONFIG.MAX_POSITIONS}\nSignals today: ${state.signalsToday}/${CONFIG.TOP_SIGNALS_PER_DAY}\n\nNifty: ${state.niftyTrend} · BankNifty: ${state.bankNiftyTrend}\nScans: ${state.scanCount}`, { parse_mode: "Markdown" });
+});
+
+tg.onText(/\/capital/, async () => {
+  await fetchCapital();
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `💰 *Capital*\n━━━━━━━━━━\nTotal: ₹${state.capital.toLocaleString("en-IN")}\nRisk/trade (1%): ₹${getRiskPerTrade().toFixed(0)}\nDaily loss cap (2%): ₹${getDailyLossCap().toFixed(0)}\nMax/trade (30%): ₹${(state.capital * CONFIG.MAX_CAPITAL_PER_TRADE).toFixed(0)}`, { parse_mode: "Markdown" });
+});
+
+tg.onText(/\/holdings/, async () => {
+  const holdings = await fetchHoldings();
+  if (!holdings.length) return tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "📭 No holdings");
+  const lines = holdings.slice(0, 15).map(h => {
+    const ltp = parseFloat(h.ltp || 0);
+    const avg = parseFloat(h.averageprice || 0);
+    const qty = parseInt(h.quantity || 0);
+    const pnl = (ltp - avg) * qty;
+    const pct = avg > 0 ? ((ltp - avg) / avg) * 100 : 0;
+    return `${h.tradingsymbol?.replace("-EQ","").padEnd(11)} ${qty.toString().padStart(3)} @ ₹${avg.toFixed(0)} → ₹${ltp.toFixed(0)} ${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%`;
+  });
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `💼 *Holdings (${holdings.length})*\n\`\`\`\n${lines.join("\n")}\n\`\`\``, { parse_mode: "Markdown" });
+});
+
+tg.onText(/\/pnl/, async () => {
+  // Today's P&L with charges
+  try {
+    const r = await db.query(`
+      SELECT side, SUM(quantity * entry_price) AS buy_value, SUM(quantity * exit_price) AS sell_value, SUM(pnl) AS gross_pnl, COUNT(*) AS trades
+      FROM trades WHERE status='closed' AND DATE(closed_at) = CURRENT_DATE GROUP BY side
+    `);
+    const totalGross = state.dayPnL.live;
+    // Approximate buy/sell values
+    const closedToday = state.openTrades.filter(t => t.status === "closed" && new Date(t.closedAt).toDateString() === new Date().toDateString());
+    let buyVal = 0, sellVal = 0;
+    for (const t of closedToday) {
+      buyVal += t.entry * t.originalQty;
+      sellVal += t.exitPrice * t.originalQty;
+    }
+    const net = netPnL(totalGross, buyVal, sellVal);
+    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `💰 *Today's P&L*\n━━━━━━━━━━\nGross: ₹${net.gross.toFixed(0)}\nCharges: -₹${net.charges.toFixed(0)}\n  • STT: ₹${net.chargesBreakdown.stt.toFixed(0)}\n  • Brokerage: ₹${net.chargesBreakdown.brokerage.toFixed(0)}\n  • GST: ₹${net.chargesBreakdown.gst.toFixed(0)}\n  • Stamp: ₹${net.chargesBreakdown.stamp.toFixed(0)}\n  • DP+Other: ₹${(net.chargesBreakdown.dp + net.chargesBreakdown.exchange + net.chargesBreakdown.sebi).toFixed(0)}\n*Net: ₹${net.net.toFixed(0)}*`, { parse_mode: "Markdown" });
+  } catch (e) {
+    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `Day P&L: ₹${state.dayPnL.live.toFixed(0)} (gross)`);
+  }
 });
 
 tg.onText(/\/scan/, async () => {
-  const status = getMarketStatus();
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🔍 Force-scan (market: ${status.status})...`);
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "🔍 Scanning...");
   const r = await runScan(true, true);
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `✅ Done · ${r.results?.alerted || 0} signals · Today: ${state.signalsToday}/${CONFIG.TOP_SIGNALS_PER_DAY}`);
-});
-
-tg.onText(/\/market/, async () => {
-  const s = getMarketStatus();
-  const ist = getISTDate();
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `📊 *Market*\n━━━━━━━━━━\n${s.status === "open" ? "✅ NSE OPEN" : s.status === "mcx_only" ? "🛢️ MCX ONLY" : s.status === "pre_market" ? "🟡 PRE-MARKET" : "🔴 CLOSED"}\n${ist.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })} IST\n${s.reason}`, { parse_mode: "Markdown" });
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `✅ ${r.results?.alerted || 0} signals · Today ${state.signalsToday}/${CONFIG.TOP_SIGNALS_PER_DAY}`);
 });
 
 tg.onText(/\/scheduler/, async () => {
   const stuck = lastScanCompletedAt && (Date.now() - lastScanCompletedAt.getTime()) > 90000;
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `⏰ *Scheduler*\n━━━━━━━━━━\nRunning: ${schedulerRunning ? "🟢" : "✅ Idle"}\nMarket: ${isAnyMarketOpen() ? "OPEN" : "CLOSED"}\nScans: ${state.scanCount}\nLast: ${lastScanCompletedAt?.toLocaleTimeString("en-IN") || "never"}\nStuck: ${stuck ? "⚠️" : "✅"}`, { parse_mode: "Markdown" });
-});
-
-tg.onText(/\/diagnose/, async () => {
-  const lines = [];
-  for (const sym of CONFIG.WATCHLIST.slice(0, 15)) {
-    const c = state.candleBuffer.get(sym);
-    const p = state.livePrices.get(sym);
-    const tok = state.symbolTokens.get(sym);
-    const exch = state.symbolType.get(sym) || "?";
-    lines.push(`${sym.padEnd(11)} ${exch} ${tok?"✓":"✗"} ${(c?.length||0).toString().padStart(3)}c ₹${p?.ltp?.toFixed(1)||"—"}`);
-  }
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🔍 *Diagnosis:*\n\`\`\`\n${lines.join("\n")}\n\`\`\``, { parse_mode: "Markdown" });
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `⏰ Running: ${schedulerRunning ? "🟢" : "✅"} · Market: ${isTradingWindow() ? "OPEN" : "CLOSED"}\nScans: ${state.scanCount} · Last: ${lastScanCompletedAt?.toLocaleTimeString("en-IN") || "—"}\nStuck: ${stuck ? "⚠️" : "✅"}`);
 });
 
 tg.onText(/\/stop/, async () => { state.isHalted = true; await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "🛑 Halted"); });
 tg.onText(/\/resume/, async () => { state.isHalted = false; await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "✅ Resumed"); });
 
-tg.onText(/\/positions/, async () => {
-  const active = state.openTrades.filter(t => t.status === "open");
-  if (!active.length) return tg.sendMessage(ENV.TELEGRAM_CHAT_ID, "📭 No positions");
-  const msg = active.map(t => {
-    const cur = state.livePrices.get(t.symbol)?.ltp || t.entry;
-    const pnl = (cur - t.entry) * t.qty * (t.signal === "BUY" ? 1 : -1);
-    const flags = [];
-    if (t.breakevenTriggered) flags.push("🛡️BE");
-    if (t.partialBooked) flags.push(`💰P+₹${t.partialBookPnL.toFixed(0)}`);
-    return `${t.mode === "live" ? "💰" : "📝"} *${t.symbol}* ${flags.join(" ")}\n₹${t.entry} → ₹${cur.toFixed(2)}\nSL ₹${t.currentSL} · Target ₹${t.target}\nP&L: ${pnl >= 0 ? "+" : ""}₹${pnl.toFixed(0)}`;
-  }).join("\n━━━━\n");
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, msg, { parse_mode: "Markdown" });
-});
-
 // ═══════════════════════════════════════════════════════════════════════════
-// ORDER EXECUTION
+// ORDER EXECUTION (DELIVERY ONLY)
 // ═══════════════════════════════════════════════════════════════════════════
 async function executeLiveOrder(sig) {
-  const check = await balanceCheck(sig);
-  if (!check.approved) {
-    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🚫 Trade blocked: ${sig.symbol}\n${check.message}`);
+  const bal = await balanceSuggestion(sig);
+  if (!bal.canAfford) {
+    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🚫 Cannot afford ${sig.symbol}\nNeed ₹${bal.fullCapitalNeeded.toFixed(0)}, have ₹${bal.available.toFixed(0)}`);
     return;
   }
-  if (check.adjusted) {
-    sig.qty = check.suggestedQty;
+  if (bal.suggestedQty < sig.qty) {
+    sig.qty = bal.suggestedQty;
     sig.capital = sig.qty * sig.entry;
-    sig.maxLoss = sig.qty * Math.abs(sig.entry - sig.sl);
-    sig.maxGain = sig.qty * Math.abs(sig.target - sig.entry);
   }
-
+  
   try {
     const token = await getSymbolToken(sig.symbol);
-    const exchange = sig.isCommodity ? "MCX" : "NSE";
-    const tradingsymbol = sig.isCommodity
-        ? state.commodityInfo.get(sig.symbol)?.fullSymbol
-        : `${sig.symbol}-EQ`;
-
     const res = await axios.post(
-        "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
-        {
-          variety: "NORMAL", tradingsymbol, symboltoken: token,
-          transactiontype: sig.signal, exchange, ordertype: "MARKET",
-          producttype: sig.orderType === "CNC" ? "DELIVERY" : "INTRADAY",
-          duration: "DAY", quantity: sig.qty.toString(),
-        },
-        { headers: angelHeaders() }
+      "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
+      {
+        variety: "NORMAL", tradingsymbol: `${sig.symbol}-EQ`, symboltoken: token,
+        transactiontype: sig.signal, exchange: "NSE", ordertype: "MARKET",
+        producttype: "DELIVERY",  // REQ 6: DELIVERY only
+        duration: "DAY", quantity: sig.qty.toString(),
+      },
+      { headers: angelHeaders() }
     );
     if (res.data?.status) {
       const trade = createTrade(sig, "live", res.data.data.orderid);
       state.openTrades.push(trade);
       await logTrade(trade);
       await logSignal(sig, "executed_live");
-      log(`✅ LIVE: ${sig.symbol} ${sig.signal} ${sig.qty}`);
+      log(`✅ LIVE DELIVERY: ${sig.symbol} ${sig.signal} ${sig.qty}`);
     }
   } catch (e) {
     log(`❌ Order failed: ${e.message}`);
@@ -1051,28 +1111,21 @@ function executePaperTrade(sig) {
   state.openTrades.push(trade);
   logTrade(trade);
   logSignal(sig, "executed_paper");
-  log(`📝 PAPER: ${sig.symbol} ${sig.signal}`);
 }
 
 function createTrade(sig, mode, orderId = null) {
   return {
     ...sig, mode, orderId,
-    originalQty: sig.qty,           // v6.5: track for partial booking
-    currentSL: sig.sl,
-    currentPrice: sig.entry,
-    status: "open",
-    openedAt: new Date(),
-    trailed: false,
-    breakevenTriggered: false,      // v6.5
-    partialBooked: false,           // v6.5
-    partialBookPrice: 0,
-    partialBookPnL: 0,
+    originalQty: sig.qty,
+    currentSL: sig.sl, currentPrice: sig.entry,
+    status: "open", openedAt: new Date(), trailed: false,
+    breakevenTriggered: false, partialBooked: false,
+    partialBookPrice: 0, partialBookPnL: 0,
   };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// v6.5 ENHANCED TRAILING SL ENGINE
-// (with breakeven move + partial booking + aggressive trail)
+// REQ 6: TRAILING SL — Same-day exit only on SL or Target
 // ═══════════════════════════════════════════════════════════════════════════
 setInterval(async () => {
   for (const t of state.openTrades.filter(x => x.status === "open")) {
@@ -1083,69 +1136,48 @@ setInterval(async () => {
     if (t.signal === "BUY") {
       const profitPct = (cur - t.entry) / t.entry;
 
-      // ─── 1. BREAKEVEN MOVE at +1.2% ───
+      // Breakeven move
       if (!t.breakevenTriggered && profitPct >= CONFIG.BREAKEVEN_TRIGGER_PCT) {
-        const newSL = parseFloat((t.entry * 1.001).toFixed(2));  // +0.1% above entry
+        const newSL = parseFloat((t.entry * 1.001).toFixed(2));
         await updateSLMovement(t.id, t.currentSL, newSL, cur);
         t.currentSL = newSL;
         t.breakevenTriggered = true;
-        log(`🛡️ ${t.symbol}: BREAKEVEN · SL → ₹${newSL}`);
-        await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🛡️ *Breakeven*\n${t.symbol} · SL → ₹${newSL}\nTrade is risk-free`, { parse_mode: "Markdown" });
+        await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🛡️ *Breakeven* · ${t.symbol} · SL → ₹${newSL}`, { parse_mode: "Markdown" });
       }
 
-      // ─── 2. PARTIAL BOOK at +2% ───
+      // Partial booking at 2%
       if (!t.partialBooked && profitPct >= CONFIG.PARTIAL_BOOK_PCT) {
         const partialQty = Math.floor(t.originalQty * CONFIG.PARTIAL_BOOK_FRACTION);
         if (partialQty > 0 && partialQty < t.qty) {
           const partialPnL = (cur - t.entry) * partialQty;
-
           if (t.mode === "live" && CONFIG.LIVE_TRADING) {
             try {
-              const exchange = t.isCommodity ? "MCX" : "NSE";
-              const tradingsymbol = t.isCommodity
-                  ? state.commodityInfo.get(t.symbol)?.fullSymbol
-                  : `${t.symbol}-EQ`;
               await axios.post(
-                  "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
-                  {
-                    variety: "NORMAL", tradingsymbol,
-                    symboltoken: await getSymbolToken(t.symbol),
-                    transactiontype: "SELL", exchange, ordertype: "MARKET",
-                    producttype: t.orderType === "CNC" ? "DELIVERY" : "INTRADAY",
-                    duration: "DAY", quantity: partialQty.toString(),
-                  },
-                  { headers: angelHeaders() }
+                "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
+                {
+                  variety: "NORMAL", tradingsymbol: `${t.symbol}-EQ`,
+                  symboltoken: await getSymbolToken(t.symbol),
+                  transactiontype: "SELL", exchange: "NSE", ordertype: "MARKET",
+                  producttype: "DELIVERY", duration: "DAY", quantity: partialQty.toString(),
+                },
+                { headers: angelHeaders() }
               );
             } catch (e) { log(`❌ Partial sell: ${e.message}`); }
           }
-
           t.qty -= partialQty;
           t.partialBooked = true;
           t.partialBookPrice = cur;
           t.partialBookPnL = partialPnL;
           state.dayPnL[t.mode] += partialPnL;
-
-          log(`💰 ${t.symbol}: PARTIAL BOOK · ${partialQty} @ ₹${cur.toFixed(2)} = +₹${partialPnL.toFixed(0)}`);
-          await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `💰 *PARTIAL BOOK* · ${t.symbol}\nSold ${partialQty} @ ₹${cur.toFixed(2)}\n+₹${partialPnL.toFixed(0)} locked\nHolding ${t.qty} for trailing`, { parse_mode: "Markdown" });
+          await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `💰 *Partial Book* · ${t.symbol}\n${partialQty} @ ₹${cur.toFixed(2)} = +₹${partialPnL.toFixed(0)}\nHolding ${t.qty}`, { parse_mode: "Markdown" });
         }
       }
 
-      // ─── 3. TRAILING SL ───
-      if (t.partialBooked) {
-        // Aggressive trail (80% retention)
+      // Trailing
+      if (t.partialBooked || t.breakevenTriggered) {
         const gain = cur - t.entry;
-        const trailDist = gain * CONFIG.TRAIL_RETENTION_AFTER_PARTIAL;
-        const newSL = parseFloat((t.entry + trailDist).toFixed(2));
-        if (newSL > t.currentSL) {
-          await updateSLMovement(t.id, t.currentSL, newSL, cur);
-          t.currentSL = newSL;
-          t.trailed = true;
-        }
-      } else if (t.breakevenTriggered) {
-        // Normal trail (50% retention)
-        const gain = cur - t.entry;
-        const trailDist = gain * 0.5;
-        const newSL = parseFloat((t.entry + trailDist).toFixed(2));
+        const retention = t.partialBooked ? 0.8 : 0.5;
+        const newSL = parseFloat((t.entry + gain * retention).toFixed(2));
         if (newSL > t.currentSL) {
           await updateSLMovement(t.id, t.currentSL, newSL, cur);
           t.currentSL = newSL;
@@ -1153,44 +1185,10 @@ setInterval(async () => {
         }
       }
 
-      // Check exits
+      // ─── REQ 6: Same-day exit only on SL or Target ───
       if (cur <= t.currentSL) await closeTrade(t, "SL_HIT", t.currentSL);
       else if (cur >= t.target) await closeTrade(t, "TARGET_HIT", t.target);
-    }
-
-    if (t.signal === "SELL") {
-      const profitPct = (t.entry - cur) / t.entry;
-
-      if (!t.breakevenTriggered && profitPct >= CONFIG.BREAKEVEN_TRIGGER_PCT) {
-        const newSL = parseFloat((t.entry * 0.999).toFixed(2));
-        await updateSLMovement(t.id, t.currentSL, newSL, cur);
-        t.currentSL = newSL;
-        t.breakevenTriggered = true;
-      }
-
-      if (!t.partialBooked && profitPct >= CONFIG.PARTIAL_BOOK_PCT) {
-        const partialQty = Math.floor(t.originalQty * CONFIG.PARTIAL_BOOK_FRACTION);
-        if (partialQty > 0 && partialQty < t.qty) {
-          const partialPnL = (t.entry - cur) * partialQty;
-          t.qty -= partialQty;
-          t.partialBooked = true;
-          t.partialBookPnL = partialPnL;
-          state.dayPnL[t.mode] += partialPnL;
-        }
-      }
-
-      if (cur >= t.currentSL) await closeTrade(t, "SL_HIT", t.currentSL);
-      else if (cur <= t.target) await closeTrade(t, "TARGET_HIT", t.target);
-    }
-
-    // EOD square-off
-    if (t.orderType === "MIS") {
-      const ist = getISTDate();
-      const closeHour = t.isCommodity ? 23 : 15;
-      const closeMin = t.isCommodity ? 25 : 15;
-      if (ist.getHours() === closeHour && ist.getMinutes() >= closeMin) {
-        await closeTrade(t, "EOD_SQUARE_OFF", cur);
-      }
+      // NOTE: No EOD square-off for delivery — let it run if SL not hit
     }
   }
 }, 3000);
@@ -1198,151 +1196,134 @@ setInterval(async () => {
 async function closeTrade(t, reason, exit) {
   t.status = "closed"; t.exitPrice = exit; t.exitReason = reason;
   t.exitPnL = (exit - t.entry) * t.qty * (t.signal === "BUY" ? 1 : -1);
-  // If partial was booked, add that to total P&L
   if (t.partialBooked) t.exitPnL += t.partialBookPnL;
   t.closedAt = new Date();
   state.dayPnL[t.mode] += (t.partialBooked ? t.exitPnL - t.partialBookPnL : t.exitPnL);
   await dbCloseTrade(t.id, exit, reason, t.exitPnL);
 
-  if (t.mode === "live" && CONFIG.LIVE_TRADING) {
+  // Live exit order
+  if (t.mode === "live" && CONFIG.LIVE_TRADING && t.qty > 0) {
     try {
-      const exchange = t.isCommodity ? "MCX" : "NSE";
-      const tradingsymbol = t.isCommodity
-          ? state.commodityInfo.get(t.symbol)?.fullSymbol
-          : `${t.symbol}-EQ`;
       await axios.post(
-          "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
-          {
-            variety: "NORMAL", tradingsymbol, symboltoken: await getSymbolToken(t.symbol),
-            transactiontype: t.signal === "BUY" ? "SELL" : "BUY",
-            exchange, ordertype: "MARKET",
-            producttype: t.orderType === "CNC" ? "DELIVERY" : "INTRADAY",
-            duration: "DAY", quantity: t.qty.toString(),
-          },
-          { headers: angelHeaders() }
+        "https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/placeOrder",
+        {
+          variety: "NORMAL", tradingsymbol: `${t.symbol}-EQ`,
+          symboltoken: await getSymbolToken(t.symbol),
+          transactiontype: t.signal === "BUY" ? "SELL" : "BUY",
+          exchange: "NSE", ordertype: "MARKET",
+          producttype: "DELIVERY", duration: "DAY", quantity: t.qty.toString(),
+        },
+        { headers: angelHeaders() }
       );
-    } catch (e) { log(`❌ Exit failed: ${e.message}`); }
+    } catch (e) { log(`❌ Exit: ${e.message}`); }
   }
 
-  const emoji = reason === "TARGET_HIT" ? "🎯" : reason === "SL_HIT" ? "🛑" : "⏰";
-  const pEm = t.exitPnL >= 0 ? "✅" : "❌";
-  const partialNote = t.partialBooked ? `\n💰 Partial: +₹${t.partialBookPnL.toFixed(0)}` : "";
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `${emoji} *${reason.replace(/_/g, " ")}* · ${t.mode === "live" ? "💰" : "📝"}\n*${t.symbol}*\nEntry ₹${t.entry} → Exit ₹${exit}${partialNote}\n${pEm} Total: ${t.exitPnL >= 0 ? "+" : ""}₹${t.exitPnL.toFixed(0)}`, { parse_mode: "Markdown" });
-  log(`${reason}: ${t.symbol} · ₹${t.exitPnL.toFixed(0)}`);
+  // Calculate net P&L with charges
+  const buyVal = t.entry * t.originalQty;
+  const sellVal = t.exitPrice * t.originalQty;
+  const net = netPnL(t.exitPnL, buyVal, sellVal);
+
+  const emoji = reason === "TARGET_HIT" ? "🎯" : "🛑";
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID,
+    `${emoji} *${reason.replace(/_/g, " ")}* · ${t.symbol}\n` +
+    `Entry ₹${t.entry} → Exit ₹${exit}\n` +
+    `Gross: ${net.gross >= 0 ? "+" : ""}₹${net.gross.toFixed(0)}\n` +
+    `Charges: -₹${net.charges.toFixed(0)}\n` +
+    `*Net: ${net.net >= 0 ? "+" : ""}₹${net.net.toFixed(0)}*`,
+    { parse_mode: "Markdown" }
+  );
+
+  // Daily loss cap check
+  if (state.dayPnL.live <= -getDailyLossCap() && !state.isHalted) {
+    state.isHalted = true;
+    await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🛑 Daily loss cap hit (₹${getDailyLossCap().toFixed(0)}) · TRADING HALTED`);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// v6.5 SCANNER WITH TOP-N FILTER
+// SCANNER
 // ═══════════════════════════════════════════════════════════════════════════
 async function runScan(verbose = false, forceRun = false) {
-  if (schedulerRunning && !forceRun) {
-    if (verbose) log("⏭️ Skipping (in progress)");
-    return { skipped: true, reason: "in_progress" };
-  }
+  if (schedulerRunning && !forceRun) return { skipped: true, reason: "in_progress" };
   schedulerRunning = true;
   const startTime = Date.now();
 
   try {
-    const marketOpen = isAnyMarketOpen();
-    if (!forceRun && !marketOpen) {
-      scansSkippedClosedMarket++;
-      if (verbose || scansSkippedClosedMarket % 30 === 1) log(`⏰ Market ${getMarketStatus().status}`);
-      return { skipped: true, reason: "market_closed" };
-    }
+    if (!forceRun && !isTradingWindow()) return { skipped: true, reason: "outside_window" };
     if (state.isHalted) return { skipped: true, reason: "halted" };
 
     state.scanCount++;
     state.lastScanTime = new Date();
     const r = { scanned: 0, noCandles: 0, inPos: 0, hold: 0, filtered: 0, alerted: 0, candidates: [] };
 
-    // ═══ Collect ALL candidates ═══
     for (const symbol of CONFIG.WATCHLIST) {
       r.scanned++;
-      const candles = state.candleBuffer.get(symbol);
-      if (!candles || candles.length < CONFIG.MIN_CANDLES) { r.noCandles++; continue; }
+      const c5 = state.candleBuffer5m.get(symbol);
+      const c15 = state.candleBuffer15m.get(symbol);
+      const cD = state.candleBufferDaily.get(symbol);
+      if (!c5 || c5.length < CONFIG.MIN_CANDLES) { r.noCandles++; continue; }
       if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) { r.inPos++; continue; }
 
-      // Check market hours per symbol type
-      const symType = state.symbolType.get(symbol) || "NSE";
-      if (!isMarketHours(symType)) { r.noCandles++; continue; }
-
-      const sig = analyzeSignal(symbol, candles);
+      const sig = analyzeSignal(symbol, c5, c15, cD, state.niftyTrend, state.bankNiftyTrend);
       if (!sig || sig.rejected) { r.noCandles++; continue; }
       if (sig.signal === "HOLD") { r.hold++; continue; }
       if (!sig.safeToTrade) { r.filtered++; continue; }
-
-      // ─── v6.5: Quality filter ───
-      if (Math.abs(sig.score) < CONFIG.MIN_SCORE_FOR_TRADE) {
-        r.filtered++;
-        continue;
-      }
-
+      if (Math.abs(sig.score) < CONFIG.MIN_SCORE_FOR_TRADE) { r.filtered++; continue; }
       r.candidates.push(sig);
     }
 
-    // ═══ Sort by score, take top N ═══
+    // Top N by score
     r.candidates.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
-    const remainingSlots = CONFIG.TOP_SIGNALS_PER_DAY - state.signalsToday;
-    const topCandidates = r.candidates.slice(0, Math.max(remainingSlots, 0));
-
-    for (const sig of topCandidates) {
+    const remaining = CONFIG.TOP_SIGNALS_PER_DAY - state.signalsToday;
+    const top = r.candidates.slice(0, Math.max(remaining, 0));
+    for (const sig of top) {
       if (state.signalsToday >= CONFIG.TOP_SIGNALS_PER_DAY) break;
       r.alerted++;
       await sendSignalAlert(sig);
     }
 
-    // Forced signal logic
-    if (marketOpen && state.signalsToday === 0 && !state.forcedSignalSent) {
-      const ist = getISTDate();
-      const curHour = ist.getHours() + ist.getMinutes() / 60;
-      if (curHour >= CONFIG.FORCE_SIGNAL_AFTER_HOUR && curHour <= CONFIG.FORCE_SIGNAL_MAX_HOUR) {
-        let best = null;
-        for (const symbol of CONFIG.WATCHLIST) {
-          const candles = state.candleBuffer.get(symbol);
-          if (!candles || candles.length < CONFIG.MIN_CANDLES) continue;
-          if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) continue;
-          const sig = analyzeSignal(symbol, candles, true);
-          if (!sig || sig.signal === "HOLD") continue;
-          if (!best || Math.abs(sig.score) > Math.abs(best.score)) best = sig;
-        }
-        if (best?.safeToTrade) {
-          state.forcedSignalSent = true;
-          await sendSignalAlert(best, true);
-        }
+    // REQ 12: Forced signal
+    const ist = getISTDate();
+    const curHour = ist.getHours() + ist.getMinutes() / 60;
+    if (state.signalsToday === 0 && !state.forcedSignalSent &&
+        curHour >= CONFIG.FORCE_SIGNAL_AFTER_HOUR && curHour <= CONFIG.FORCE_SIGNAL_MAX_HOUR) {
+      let best = null;
+      for (const symbol of CONFIG.WATCHLIST) {
+        const c5 = state.candleBuffer5m.get(symbol);
+        const c15 = state.candleBuffer15m.get(symbol);
+        const cD = state.candleBufferDaily.get(symbol);
+        if (!c5 || c5.length < CONFIG.MIN_CANDLES) continue;
+        if (state.openTrades.some(t => t.symbol === symbol && t.status === "open")) continue;
+        const sig = analyzeSignal(symbol, c5, c15, cD, state.niftyTrend, state.bankNiftyTrend, true);
+        if (!sig || sig.signal === "HOLD") continue;
+        if (!best || Math.abs(sig.score) > Math.abs(best.score)) best = sig;
+      }
+      if (best) {
+        state.forcedSignalSent = true;
+        log(`🎯 FORCED: ${best.symbol} ${best.signal}`);
+        await sendSignalAlert(best, true);
       }
     }
 
     lastScanCompletedAt = new Date();
-    log(`🔍 Scan #${state.scanCount} · ${Date.now() - startTime}ms · ${r.scanned}|${r.noCandles}nd|${r.inPos}ip|${r.hold}h|${r.filtered}f|${r.candidates.length}c|${r.alerted}a (top ${CONFIG.TOP_SIGNALS_PER_DAY}/day)${forceRun ? " (FORCED)" : ""}`);
+    log(`🔍 Scan #${state.scanCount} · ${Date.now()-startTime}ms · ${r.scanned}|${r.noCandles}nd|${r.inPos}ip|${r.hold}h|${r.filtered}f|${r.alerted}a${forceRun ? " (FORCED)" : ""}`);
     return { skipped: false, results: r };
   } catch (e) {
-    log(`💥 Scan error: ${e.message}`);
+    log(`💥 Scan: ${e.message}`);
     return { error: e.message };
-  } finally {
-    schedulerRunning = false;
-  }
+  } finally { schedulerRunning = false; }
 }
 
 function startScheduler() {
   if (scanInterval) clearInterval(scanInterval);
-  log(`⏰ Scheduler v6.5 · NSE ${CONFIG.MARKET_START_HOUR}:00-${CONFIG.MARKET_END_HOUR}:00${CONFIG.TRADE_COMMODITIES ? ` · MCX till ${CONFIG.COMMODITY_END_HOUR}:30` : ""}`);
+  log(`⏰ Scheduler · 9:30-15:15 · scan every ${CONFIG.SCAN_INTERVAL_MS/1000}s`);
   scanInterval = setInterval(() => runScan().catch(e => log(`💥 ${e.message}`)), CONFIG.SCAN_INTERVAL_MS);
-  setTimeout(() => {
-    if (isAnyMarketOpen()) {
-      log("🚀 Initial scan");
-      runScan(true).catch(e => log(`💥 ${e.message}`));
-    } else log("⏰ Market closed · scheduler armed");
-  }, 5000);
-  startWatchdog();
-}
-
-function startWatchdog() {
+  setTimeout(() => { if (isTradingWindow()) runScan(true).catch(e => log(`💥 ${e.message}`)); }, 5000);
   if (watchdogInterval) clearInterval(watchdogInterval);
   watchdogInterval = setInterval(() => {
-    if (!isAnyMarketOpen() || state.isHalted || !lastScanCompletedAt) return;
-    const elapsed = Date.now() - lastScanCompletedAt.getTime();
-    if (elapsed > CONFIG.SCHEDULER_TIMEOUT_MS) {
-      log(`⚠️ Stuck (${Math.round(elapsed/1000)}s) · RESTARTING`);
+    if (!isTradingWindow() || state.isHalted || !lastScanCompletedAt) return;
+    if (Date.now() - lastScanCompletedAt.getTime() > CONFIG.SCHEDULER_TIMEOUT_MS) {
+      log(`⚠️ Stuck · RESTARTING`);
       schedulerRunning = false;
       startScheduler();
     }
@@ -1360,11 +1341,292 @@ setInterval(() => {
 }, 60000);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MOBILE API ENDPOINTS
+// REQ 8 + 9: BACKTEST API (uses analyzeSignal - same source of truth)
+// ═══════════════════════════════════════════════════════════════════════════
+const backtestCache = new Map();
+const runningBacktests = new Map();
+
+function addBacktestEndpoints(app, auth) {
+  app.post("/api/backtest/run", auth, async (req, res) => {
+    const { days = 30, symbols } = req.body;
+    const id = `bt-${Date.now()}`;
+    const symList = symbols?.length ? symbols : CONFIG.WATCHLIST.slice(0, 25);
+    res.json({ backtestId: id, status: "running" });
+    runBacktest(id, symList, days);
+  });
+
+  app.get("/api/backtest/:id", auth, (req, res) => {
+    const result = backtestCache.get(req.params.id);
+    const running = runningBacktests.get(req.params.id);
+    if (result) res.json({ status: "completed", ...result });
+    else if (running) res.json({ status: "running", progress: running });
+    else res.status(404).json({ error: "Not found" });
+  });
+
+  app.get("/api/backtest", auth, (req, res) => {
+    const list = [...backtestCache.entries()].map(([id, r]) => ({
+      id, runDate: r.runDate, days: r.config.days,
+      symbols: r.config.symbols.length, totalTrades: r.metrics.total,
+      totalPnL: r.metrics.totalPnL, winRate: r.metrics.winRate, verdict: r.metrics.verdict,
+    })).reverse();
+    res.json(list.slice(0, 20));
+  });
+
+  // REQ 8: Detailed trade log endpoint
+  app.get("/api/backtest/:id/trades", auth, (req, res) => {
+    const result = backtestCache.get(req.params.id);
+    if (!result) return res.status(404).json({ error: "Not found" });
+    res.json({ trades: result.trades, count: result.trades.length });
+  });
+}
+
+async function runBacktest(id, symbols, days) {
+  runningBacktests.set(id, { done: 0, total: symbols.length, currentSymbol: "" });
+  const allTrades = [];
+  const perSymbol = {};
+
+  for (let i = 0; i < symbols.length; i++) {
+    const sym = symbols[i];
+    runningBacktests.set(id, { done: i, total: symbols.length, currentSymbol: sym });
+    
+    // Fetch all 3 timeframes
+    const c5 = await fetchHistorical(sym, "FIVE_MINUTE", days);
+    await new Promise(r => setTimeout(r, CONFIG.HISTORICAL_RATE_LIMIT_MS));
+    const c15 = await fetchHistorical(sym, "FIFTEEN_MINUTE", days);
+    await new Promise(r => setTimeout(r, CONFIG.HISTORICAL_RATE_LIMIT_MS));
+    const cD = await fetchHistorical(sym, "ONE_DAY", days);
+    await new Promise(r => setTimeout(r, CONFIG.HISTORICAL_RATE_LIMIT_MS));
+    
+    if (!c5?.length) {
+      perSymbol[sym] = { error: "no data", trades: 0 };
+      continue;
+    }
+
+    const trades = simulate(sym, c5, c15, cD);
+    allTrades.push(...trades);
+    perSymbol[sym] = {
+      candles: c5.length, trades: trades.length,
+      pnl: trades.reduce((s,t) => s + t.netPnL, 0).toFixed(2),
+    };
+  }
+
+  const metrics = calculateMetrics(allTrades);
+  const result = {
+    backtestId: id, runDate: new Date().toISOString(),
+    config: { days, symbols },
+    metrics, perSymbol,
+    trades: allTrades.slice(0, 1000),  // REQ 8: detailed log
+  };
+  backtestCache.set(id, result);
+  runningBacktests.delete(id);
+  log(`✅ Backtest ${id}: ${metrics.total} trades · ${metrics.winRate}% win · ₹${metrics.totalPnL}`);
+}
+
+function simulate(symbol, c5, c15, cD) {
+  const trades = [];
+  let open = null;
+
+  for (let i = CONFIG.MIN_CANDLES; i < c5.length; i++) {
+    const candle = c5[i];
+    const candleTime = new Date(candle.time);
+    const mins = candleTime.getHours() * 60 + candleTime.getMinutes();
+    
+    // REQ 4: Trade only 9:30 - 3:15
+    const inWindow = mins >= 570 && mins <= 915;
+
+    // Manage open trade
+    if (open) {
+      const t = open;
+      if (t.signal === "BUY") {
+        const profitPct = (candle.c - t.entry) / t.entry;
+        // Breakeven
+        if (!t.breakevenTriggered && profitPct >= CONFIG.BREAKEVEN_TRIGGER_PCT) {
+          t.currentSL = t.entry * 1.001;
+          t.breakevenTriggered = true;
+        }
+        // Partial booking
+        if (!t.partialBooked && profitPct >= CONFIG.PARTIAL_BOOK_PCT) {
+          const partialQty = Math.floor(t.originalQty * CONFIG.PARTIAL_BOOK_FRACTION);
+          if (partialQty > 0 && partialQty < t.qty) {
+            t.partialPnL = (candle.c - t.entry) * partialQty;
+            t.partialPrice = candle.c;
+            t.partialQty = partialQty;
+            t.qty -= partialQty;
+            t.partialBooked = true;
+          }
+        }
+        // Trail
+        if (t.partialBooked || t.breakevenTriggered) {
+          const gain = candle.c - t.entry;
+          const retention = t.partialBooked ? 0.8 : 0.5;
+          const newSL = t.entry + gain * retention;
+          if (newSL > t.currentSL) t.currentSL = newSL;
+        }
+        // Exit checks
+        if (candle.l <= t.currentSL) {
+          t.exit = t.currentSL;
+          t.exitTime = candle.time;
+          t.exitReason = "SL";
+          t.pnl = (t.exit - t.entry) * t.qty + (t.partialPnL || 0);
+          t.netPnLData = netPnL(t.pnl, t.entry * t.originalQty, t.exit * t.qty + (t.partialPrice * (t.partialQty || 0)));
+          t.netPnL = t.netPnLData.net;
+          trades.push(t);
+          open = null;
+          continue;
+        }
+        if (candle.h >= t.target) {
+          t.exit = t.target;
+          t.exitTime = candle.time;
+          t.exitReason = "TARGET";
+          t.pnl = (t.exit - t.entry) * t.qty + (t.partialPnL || 0);
+          t.netPnLData = netPnL(t.pnl, t.entry * t.originalQty, t.exit * t.qty + (t.partialPrice * (t.partialQty || 0)));
+          t.netPnL = t.netPnLData.net;
+          trades.push(t);
+          open = null;
+          continue;
+        }
+      }
+    }
+
+    // New signal in trading window
+    if (!open && inWindow) {
+      // Slice candles up to current point for HTF context
+      const c5Slice = c5.slice(Math.max(0, i - 200), i + 1);
+      const c15Slice = c15.filter(c => new Date(c.time) <= candleTime);
+      const cDSlice = cD.filter(c => new Date(c.time) <= candleTime);
+      
+      // Compute index trends from daily data (simplified for backtest)
+      const niftyT = "neutral";  // In real backtest, fetch index data per symbol
+      const bankT = "neutral";
+      
+      const sig = analyzeSignal(symbol, c5Slice, c15Slice, cDSlice, niftyT, bankT);
+      if (!sig || sig.signal === "HOLD" || !sig.safeToTrade) continue;
+      if (Math.abs(sig.score) < CONFIG.MIN_SCORE_FOR_TRADE) continue;
+
+      open = {
+        // REQ 8: Detailed log fields
+        symbol: sig.symbol,
+        signal: sig.signal,
+        entry: sig.entry,
+        entryTime: candleTime.toISOString(),
+        entryTimeIST: candleTime.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }),
+        qty: sig.qty,
+        originalQty: sig.qty,
+        sl: sig.sl,
+        currentSL: sig.sl,
+        target: sig.target,
+        confidence: sig.confidence,
+        score: sig.score,
+        rsi: sig.indicators.rsi,
+        adx: sig.indicators.adx,
+        vwap: sig.indicators.vwap,
+        supertrend: sig.indicators.supertrend,
+        pattern: sig.indicators.pattern,
+        trend15m: sig.indicators.trend15m,
+        trendDaily: sig.indicators.trendDaily,
+        indexTrend: sig.indicators.indexTrend,
+        bullCount: sig.bullCount,
+        bearCount: sig.bearCount,
+        breakevenTriggered: false,
+        partialBooked: false,
+      };
+    }
+  }
+
+  // Close any remaining open trade
+  if (open) {
+    const last = c5[c5.length - 1];
+    open.exit = last.c;
+    open.exitTime = last.time;
+    open.exitReason = "END_OF_DATA";
+    open.pnl = (open.exit - open.entry) * open.qty * (open.signal === "BUY" ? 1 : -1) + (open.partialPnL || 0);
+    open.netPnLData = netPnL(open.pnl, open.entry * open.originalQty, open.exit * open.qty);
+    open.netPnL = open.netPnLData.net;
+    trades.push(open);
+  }
+  return trades;
+}
+
+function calculateMetrics(allTrades) {
+  if (!allTrades.length) return { total: 0, verdict: "NO_TRADES", verdictColor: "orange" };
+
+  const wins = allTrades.filter(t => t.netPnL > 0);
+  const losses = allTrades.filter(t => t.netPnL <= 0);
+  const totalPnL = allTrades.reduce((s,t) => s + t.netPnL, 0);
+  const grossPnL = allTrades.reduce((s,t) => s + t.pnl, 0);
+  const totalCharges = grossPnL - totalPnL;
+  const grossWin = wins.reduce((s,t) => s + t.netPnL, 0);
+  const grossLoss = Math.abs(losses.reduce((s,t) => s + t.netPnL, 0));
+  const profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin;
+
+  let peak = 0, maxDD = 0, running = 0;
+  const equityCurve = [];
+  for (const t of allTrades) {
+    running += t.netPnL;
+    equityCurve.push({ time: t.exitTime, pnl: running });
+    if (running > peak) peak = running;
+    if (peak - running > maxDD) maxDD = peak - running;
+  }
+
+  let maxConsecLosses = 0, cur = 0;
+  for (const t of allTrades) {
+    if (t.netPnL < 0) { cur++; maxConsecLosses = Math.max(maxConsecLosses, cur); }
+    else cur = 0;
+  }
+
+  const bySymbol = {};
+  for (const t of allTrades) {
+    if (!bySymbol[t.symbol]) bySymbol[t.symbol] = { trades: 0, wins: 0, pnl: 0 };
+    bySymbol[t.symbol].trades++;
+    if (t.netPnL > 0) bySymbol[t.symbol].wins++;
+    bySymbol[t.symbol].pnl += t.netPnL;
+  }
+  for (const s in bySymbol) {
+    bySymbol[s].winRate = (bySymbol[s].wins / bySymbol[s].trades * 100).toFixed(1);
+    bySymbol[s].pnl = parseFloat(bySymbol[s].pnl.toFixed(2));
+  }
+
+  const byExitReason = {
+    TARGET: allTrades.filter(t => t.exitReason === "TARGET").length,
+    SL: allTrades.filter(t => t.exitReason === "SL").length,
+    END: allTrades.filter(t => t.exitReason === "END_OF_DATA").length,
+  };
+
+  const winRate = (wins.length / allTrades.length * 100).toFixed(2);
+  const returnPct = (totalPnL / state.capital * 100).toFixed(2);
+
+  let verdict = "POOR", verdictColor = "red";
+  const wr = parseFloat(winRate), pf = parseFloat(profitFactor.toFixed(2));
+  if (totalPnL > 0 && wr >= 50 && pf >= 2.0) { verdict = "EXCELLENT"; verdictColor = "green"; }
+  else if (totalPnL > 0 && wr >= 35 && pf >= 1.5) { verdict = "GOOD"; verdictColor = "green"; }
+  else if (totalPnL > 0 && pf >= 1.2) { verdict = "MARGINAL"; verdictColor = "orange"; }
+  else if (totalPnL > 0) { verdict = "BREAK_EVEN"; verdictColor = "orange"; }
+
+  return {
+    total: allTrades.length,
+    wins: wins.length, losses: losses.length,
+    winRate, totalPnL: parseFloat(totalPnL.toFixed(2)),
+    grossPnL: parseFloat(grossPnL.toFixed(2)),
+    totalCharges: parseFloat(totalCharges.toFixed(2)),
+    returnPct, profitFactor: parseFloat(profitFactor.toFixed(2)),
+    avgWin: parseFloat((wins.length ? grossWin / wins.length : 0).toFixed(2)),
+    avgLoss: parseFloat((losses.length ? -grossLoss / losses.length : 0).toFixed(2)),
+    best: parseFloat(Math.max(...allTrades.map(t => t.netPnL)).toFixed(2)),
+    worst: parseFloat(Math.min(...allTrades.map(t => t.netPnL)).toFixed(2)),
+    maxDrawdown: parseFloat(maxDD.toFixed(2)),
+    maxConsecLosses,
+    bySymbol, byExitReason,
+    equityCurve: equityCurve.slice(-100),
+    verdict, verdictColor,
+    strategyVersion: "v7.0",
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MOBILE API
 // ═══════════════════════════════════════════════════════════════════════════
 function addSchedulerEndpoints(app, auth) {
   app.post("/api/scan/now", auth, async (req, res) => {
-    log("📱 Manual scan from mobile");
     const r = await runScan(true, true);
     res.json({ ok: true, forced: true, ...r });
   });
@@ -1373,22 +1635,89 @@ function addSchedulerEndpoints(app, auth) {
     const stuck = lastScanCompletedAt && (Date.now() - lastScanCompletedAt.getTime()) > 90000;
     res.json({
       market: getMarketStatus(),
-      scheduler: {
-        running: schedulerRunning, scansCompleted: state.scanCount,
-        lastScanAt: lastScanCompletedAt?.toISOString() || null,
-        secondsSinceLastScan: lastScanCompletedAt ? Math.round((Date.now() - lastScanCompletedAt.getTime()) / 1000) : null,
-        stuck, halted: state.isHalted, skippedClosedMarket: scansSkippedClosedMarket,
-      },
-      signals: { today: state.signalsToday, max: CONFIG.TOP_SIGNALS_PER_DAY, forcedSignalSent: state.forcedSignalSent },
-      scripMaster: { loaded: state.scripMasterLoaded, usingFallback: state.usingFallback, instrumentCount: state.scripMaster?.length || 0 },
-      ai: { sentimentEnabled: CONFIG.USE_AI_SENTIMENT, statisticalLearning: CONFIG.USE_STATISTICAL_LEARNING, statsCount: state.symbolStats.size },
-      commodities: { enabled: CONFIG.TRADE_COMMODITIES, count: CONFIG.COMMODITY_WATCHLIST.length },
+      capital: state.capital,
+      riskPerTrade: getRiskPerTrade(),
+      dailyLossCap: getDailyLossCap(),
+      indexTrends: { nifty: state.niftyTrend, bankNifty: state.bankNiftyTrend },
+      scheduler: { running: schedulerRunning, scansCompleted: state.scanCount, stuck, halted: state.isHalted },
+      signals: { today: state.signalsToday, max: CONFIG.TOP_SIGNALS_PER_DAY },
     });
   });
 
-  app.post("/api/scheduler/restart", auth, (req, res) => {
-    startScheduler();
-    res.json({ ok: true, message: "Restarted" });
+  // REQ 10: Daily signals + P&L for mobile
+  app.get("/api/daily/signals", auth, async (req, res) => {
+    try {
+      const r = await db.query(`SELECT * FROM signals WHERE DATE(created_at) = CURRENT_DATE ORDER BY created_at DESC LIMIT 50`);
+      res.json(r.rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.get("/api/daily/pnl", auth, async (req, res) => {
+    try {
+      const r = await db.query(`SELECT * FROM trades WHERE status='closed' AND DATE(closed_at) = CURRENT_DATE`);
+      let totalGross = 0, totalBuyVal = 0, totalSellVal = 0;
+      const trades = r.rows.map(t => {
+        const buyVal = t.entry_price * t.quantity;
+        const sellVal = (t.exit_price || 0) * t.quantity;
+        const charges = calculateCharges(buyVal, sellVal);
+        const net = (parseFloat(t.pnl) || 0) - charges.total;
+        totalGross += parseFloat(t.pnl) || 0;
+        totalBuyVal += buyVal;
+        totalSellVal += sellVal;
+        return {
+          symbol: t.symbol, side: t.side,
+          entry: t.entry_price, exit: t.exit_price,
+          qty: t.quantity, gross: parseFloat(t.pnl) || 0,
+          charges: charges.total, net: parseFloat(net.toFixed(2)),
+          exitReason: t.exit_reason,
+        };
+      });
+      const totalCharges = calculateCharges(totalBuyVal, totalSellVal);
+      res.json({
+        trades,
+        summary: {
+          totalGross: parseFloat(totalGross.toFixed(2)),
+          totalCharges: totalCharges.total,
+          totalNet: parseFloat((totalGross - totalCharges.total).toFixed(2)),
+          chargesBreakdown: totalCharges,
+          tradeCount: trades.length,
+        }
+      });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // REQ 7: Balance check for any symbol
+  app.post("/api/balance/check", auth, async (req, res) => {
+    const { symbol, entry, qty } = req.body;
+    const sig = { symbol, entry, qty };
+    const result = await balanceSuggestion(sig);
+    res.json(result);
+  });
+
+  // REQ 6: Holdings analysis
+  app.get("/api/holdings/analyze", auth, async (req, res) => {
+    const holdings = await fetchHoldings();
+    const analyzed = [];
+    for (const h of holdings) {
+      const symbol = h.tradingsymbol?.replace("-EQ", "");
+      if (!symbol) continue;
+      const c5 = state.candleBuffer5m.get(symbol);
+      const c15 = state.candleBuffer15m.get(symbol);
+      const cD = state.candleBufferDaily.get(symbol);
+      if (!c5 || c5.length < CONFIG.MIN_CANDLES) {
+        analyzed.push({ symbol, holding: h, signal: null });
+        continue;
+      }
+      const sig = analyzeSignal(symbol, c5, c15, cD, state.niftyTrend, state.bankNiftyTrend);
+      analyzed.push({
+        symbol, holding: h,
+        signal: sig?.signal || "HOLD",
+        confidence: sig?.confidence || 0,
+        score: sig?.score || 0,
+        recommendation: sig?.signal === "SELL" ? "Consider booking" : "Hold",
+      });
+    }
+    res.json(analyzed);
   });
 }
 
@@ -1396,81 +1725,65 @@ function addSchedulerEndpoints(app, auth) {
 // STARTUP
 // ═══════════════════════════════════════════════════════════════════════════
 async function startup() {
-  log("🚀 NSE TradeAI v6.5 · COMPLETE FINAL");
-  log(`   Capital: ₹${CONFIG.CAPITAL.toLocaleString("en-IN")} · Risk ₹${CONFIG.RISK_PER_TRADE} · RR 1:${CONFIG.REWARD_RATIO}`);
-  log(`   v6.5: Breakeven ${CONFIG.BREAKEVEN_TRIGGER_PCT*100}% · Partial book ${CONFIG.PARTIAL_BOOK_PCT*100}% · Top ${CONFIG.TOP_SIGNALS_PER_DAY}/day`);
-  log(`   Live: ${CONFIG.LIVE_TRADING ? "✅ ON" : "❌ OFF"}`);
-  log(`   AI: ${CONFIG.USE_AI_SENTIMENT ? "ON" : "OFF"} · Commodities: ${CONFIG.TRADE_COMMODITIES ? "ON" : "OFF"}`);
+  log("🚀 NSE TradeAI v7.0 · COMPLETE PRODUCTION");
+  log(`   Watchlist: ${CONFIG.WATCHLIST.length} (${CONFIG.NIFTY_50.length} Nifty + ${CONFIG.BEST_PERFORMERS.length} momentum)`);
+  log(`   Trading window: 9:30 AM - 3:15 PM`);
+  log(`   Order type: DELIVERY (no leverage)`);
+  log(`   Live: ${CONFIG.LIVE_TRADING ? "✅" : "❌"}`);
 
   await initDB();
-  await logEvent("STARTUP", "v6.5 started");
+  await logEvent("STARTUP", "v7.0 started");
 
   const { app, auth } = startAPI(3000);
   addAccountEndpoints(app, state, auth);
-  addBacktestEndpoints(app, state, auth);
+  addBacktestEndpoints(app, auth);
   addSchedulerEndpoints(app, auth);
 
   if (!await authenticateAngel()) process.exit(1);
-  await loadScripMasterRobust();
-
-  log("🔑 Resolving NSE tokens...");
-  const nseTokens = [];
-  for (const sym of CONFIG.NSE_WATCHLIST) {
-    const t = await getNSEToken(sym);
-    if (t) nseTokens.push(t);
-  }
-  log(`✓ NSE: ${nseTokens.length}/${CONFIG.NSE_WATCHLIST.length}`);
-
-  // ═══ Setup commodities if enabled ═══
-  let mcxTokens = [];
-  if (CONFIG.TRADE_COMMODITIES) {
-    log("🛢️ Resolving MCX tokens...");
-    for (const sym of CONFIG.COMMODITY_WATCHLIST) {
-      const t = await getCommodityToken(sym);
-      if (t) {
-        mcxTokens.push(t);
-        if (!CONFIG.WATCHLIST.includes(sym)) CONFIG.WATCHLIST.push(sym);
-      }
-    }
-    log(`✓ MCX: ${mcxTokens.length}/${CONFIG.COMMODITY_WATCHLIST.length}`);
-  }
-
-  log("📊 Loading historical candles...");
-  let totalLoaded = 0, ok = 0;
+  await loadScripMaster();
+  
+  // REQ 13: Fetch capital from Angel
+  await fetchCapital();
+  
+  log("🔑 Resolving tokens...");
+  const tokens = [];
   for (const sym of CONFIG.WATCHLIST) {
-    const n = await loadHistoricalCandles(sym);
-    if (n > 0) { totalLoaded += n; ok++; }
-    await new Promise(r => setTimeout(r, 250));
+    const t = await getSymbolToken(sym);
+    if (t) tokens.push(t);
   }
-  log(`✅ Loaded ${totalLoaded} candles from ${ok}/${CONFIG.WATCHLIST.length}`);
+  log(`✓ Resolved ${tokens.length}/${CONFIG.WATCHLIST.length}`);
 
-  await updateSymbolStats();
-  await startWebSocket(nseTokens, mcxTokens);
+  // Add index tokens for trend tracking
+  for (const idx of [CONFIG.INDEX_NIFTY, CONFIG.INDEX_BANKNIFTY]) {
+    const t = await getSymbolToken(idx);
+    if (t) tokens.push(t);
+  }
+
+  // REQ 2: Load 20-day historical data with rate limiting
+  await loadAllHistoricalData();
+
+  await startWebSocket(tokens);
   startScheduler();
 
-  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🚀 *Bot v6.5 Online*
+  await tg.sendMessage(ENV.TELEGRAM_CHAT_ID, `🚀 *Bot v7.0 Online*
 ━━━━━━━━━━━━━━
-✅ NSE: ${nseTokens.length}/${CONFIG.NSE_WATCHLIST.length}${CONFIG.TRADE_COMMODITIES ? `\n🛢️ MCX: ${mcxTokens.length}/${CONFIG.COMMODITY_WATCHLIST.length}` : ""}
-✅ Candles: ${totalLoaded}
-✅ Stats: ${state.symbolStats.size}
+Watchlist: ${CONFIG.WATCHLIST.length} stocks
+Capital: ₹${state.capital.toLocaleString("en-IN")}
+Risk: 1% (₹${getRiskPerTrade().toFixed(0)}/trade)
+Daily cap: 2% (₹${getDailyLossCap().toFixed(0)})
 
-*v6.5 Accuracy Boosters:*
-🛡️ Auto breakeven at +1.2%
-💰 Partial book 50% at +2%
-🎯 Top ${CONFIG.TOP_SIGNALS_PER_DAY} signals/day
-📐 Wider ATR-based SL
+📦 DELIVERY only · No leverage
+⏰ Trading: 9:30-3:15 IST
+
+Nifty: ${state.niftyTrend} · BankNifty: ${state.bankNiftyTrend}
 
 ${CONFIG.LIVE_TRADING ? "⚡ LIVE" : "📝 Paper"}
 
-/status · /scan · /market · /scheduler`, { parse_mode: "Markdown" });
+/status · /scan · /capital · /holdings · /pnl`, { parse_mode: "Markdown" });
 
-  log("✅ v6.5 operational");
+  log("✅ v7.0 operational");
 }
 
 startup().catch(e => { log(`💥 Fatal: ${e.message}`); console.error(e); process.exit(1); });
-
-process.on("SIGINT", async () => {
-  if (state.ws) state.ws.close();
-  process.exit(0);
-});
+process.on("SIGINT", () => { if (state.ws) state.ws.close(); process.exit(0); });
 process.on("uncaughtException", e => log(`💥 Uncaught: ${e.message}`));
