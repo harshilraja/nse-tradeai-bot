@@ -56,13 +56,13 @@ const CONFIG = {
   // ─── Quality filter ───
   TOP_SIGNALS_PER_DAY:   5,
   MIN_SCORE_FOR_TRADE:   3.5,
-  SIGNAL_SCORE_BUY:      3.5,
-  SIGNAL_SCORE_SELL:     -3.5,
+  SIGNAL_SCORE_BUY:      5,
+  SIGNAL_SCORE_SELL:     -5,
   MIN_CONFLUENCE:        3,
   MIN_CONFIDENCE:        60,
-  MIN_VOLUME_RATIO:      1.2,
+  MIN_VOLUME_RATIO:      1.5,
   MIN_CANDLES:           30,
-  MIN_ADX:               20,
+  MIN_ADX:               25,
 
   // ─── REQ 4: Trading window 9:30 AM - 3:15 PM ───
   TRADING_START_HOUR:    9,
@@ -75,8 +75,8 @@ const CONFIG = {
   HISTORICAL_RATE_LIMIT_MS: 1100,  // ~1 req/sec to respect Angel rate limits
 
   // ─── REQ 12: Forced signal logic ───
-  FORCE_SIGNAL_AFTER_HOUR: 11.5,   // After 11:30 AM
-  FORCE_SIGNAL_MAX_HOUR:   14.5,   // Until 2:30 PM
+  FORCE_SIGNAL_AFTER_HOUR: null,   // After 11:30 AM
+  FORCE_SIGNAL_MAX_HOUR:   null,   // Until 2:30 PM
 
   // ─── REQ 6: Order type — DELIVERY only ───
   ORDER_TYPE:            "DELIVERY",  // CNC, no leverage
@@ -621,188 +621,155 @@ function bollinger(c, p=20) { if (c.length < p) return { upper:0, lower:0, mid:0
 // Single source of truth — used by both live bot AND backtest
 // ═══════════════════════════════════════════════════════════════════════════
 export function analyzeSignal(symbol, candles5m, candles15m, candlesDaily, niftyTrend, bankNiftyTrend, relaxed = false) {
-  if (candles5m.length < CONFIG.MIN_CANDLES) return { rejected: true, reason: `${candles5m.length} candles` };
+
+  if (candles5m.length < CONFIG.MIN_CANDLES) {
+    return { rejected: true, reason: "Not enough candles" };
+  }
 
   const closes = candles5m.map(c => c.c);
   const vols = candles5m.map(c => c.v);
   const price = closes[closes.length - 1];
-  
-  // 5-min indicators
-  const R = rsi(closes), M = macd(closes);
-  const e9 = ema(closes, 9), e21 = ema(closes, 21), e50 = ema(closes, 50);
-  const e200 = ema(closes, Math.min(200, closes.length-1));
+
+  // Indicators
+  const R = rsi(closes);
+  const M = macd(closes);
+  const e9 = ema(closes, 9);
+  const e21 = ema(closes, 21);
+  const e50 = ema(closes, 50);
+  const e200 = ema(closes, Math.min(200, closes.length - 1));
   const vw = vwap(candles5m);
   const adxData = adx(candles5m);
   const st = supertrend(candles5m);
   const bb = bollinger(closes);
   const a = atr(candles5m);
-  const avgVol = vols.slice(-20).reduce((a,b) => a+b, 0) / Math.min(20, vols.length);
-  const volRatio = avgVol > 0 ? vols[vols.length-1] / avgVol : 1;
 
-  if (!relaxed && adxData.adx < CONFIG.MIN_ADX) {
-    return { rejected: true, reason: `ADX ${adxData.adx.toFixed(1)} < ${CONFIG.MIN_ADX}` };
+  const avgVol = vols.slice(-20).reduce((a, b) => a + b, 0) / 20;
+  const volRatio = vols[vols.length - 1] / (avgVol || 1);
+
+  // 🚨 STRONG TREND FILTER
+  const isStrongTrend =
+      (e9 > e21 && e21 > e50 && adxData.adx > 25) ||
+      (e9 < e21 && e21 < e50 && adxData.adx > 25);
+
+  if (!relaxed && !isStrongTrend) {
+    return { rejected: true, reason: "Weak trend" };
   }
 
-  // ─── REQ 3: 15-min HTF trend ───
+  // HTF Trends
   let trend15m = "neutral";
-  if (candles15m && candles15m.length > 21) {
+  if (candles15m?.length > 21) {
     const c15 = candles15m.map(c => c.c);
-    const e9_15 = ema(c15, 9);
-    const e21_15 = ema(c15, 21);
-    if (e9_15 > e21_15) trend15m = "bullish";
-    else if (e9_15 < e21_15) trend15m = "bearish";
+    trend15m = ema(c15, 9) > ema(c15, 21) ? "bullish" : "bearish";
   }
-  
-  // ─── REQ 3: Daily HTF trend ───
+
   let trendDaily = "neutral";
-  if (candlesDaily && candlesDaily.length > 21) {
+  if (candlesDaily?.length > 21) {
     const cD = candlesDaily.map(c => c.c);
-    const e9_d = ema(cD, 9);
-    const e21_d = ema(cD, 21);
-    if (e9_d > e21_d) trendDaily = "bullish";
-    else if (e9_d < e21_d) trendDaily = "bearish";
+    trendDaily = ema(cD, 9) > ema(cD, 21) ? "bullish" : "bearish";
   }
 
-  // ─── REQ 5: Determine relevant index trend ───
-  // Banking stocks → BankNifty, others → Nifty
-  const bankingStocks = ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK","BAJFINANCE","BAJAJFINSV","SBILIFE","HDFCLIFE"];
-  const relevantIndex = bankingStocks.includes(symbol) ? bankNiftyTrend : niftyTrend;
+  const bankingStocks = ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK"];
+  const indexTrend = bankingStocks.includes(symbol) ? bankNiftyTrend : niftyTrend;
 
-  // Patterns
-  const last = candles5m[candles5m.length-1];
-  const prev = candles5m[candles5m.length-2];
-  const isBullishEngulfing = prev && last.c > last.o && prev.c < prev.o && last.c > prev.o && last.o < prev.c;
-  const isHammer = last && (last.c - last.l) > 2 * (last.h - last.c) && last.c > last.o;
-  const isBearishEngulfing = prev && last.c < last.o && prev.c > prev.o && last.c < prev.o && last.o > prev.c;
-  const isShootingStar = last && (last.h - last.c) > 2 * (last.c - last.l) && last.c < last.o;
+  // 🎯 BREAKOUT LOGIC
+  const recentHigh = Math.max(...closes.slice(-20));
+  const recentLow = Math.min(...closes.slice(-20));
 
-  let score = 0, bullCount = 0, bearCount = 0;
-  const checks = {};
+  const isBreakoutBuy = price > recentHigh * 1.002;
+  const isBreakoutSell = price < recentLow * 0.998;
 
-  // RSI
-  if (R < 30) { score += 2; bullCount++; checks.rsi = "oversold"; }
-  else if (R > 70) { score -= 2; bearCount++; checks.rsi = "overbought"; }
-  else if (R < 45 && trendDaily === "bullish") { score += 1; bullCount++; checks.rsi = "bull"; }
-  else if (R > 55 && trendDaily === "bearish") { score -= 1; bearCount++; checks.rsi = "bear"; }
-  else checks.rsi = "neutral";
+  // 🎯 SCORING
+  let score = 0;
 
-  // MACD
-  if (M.bullish && M.value > 0) { score += 1.5; bullCount++; checks.macd = "bull"; }
-  else if (!M.bullish && M.value < 0) { score -= 1.5; bearCount++; checks.macd = "bear"; }
+  if (R < 35) score += 1;
+  if (R > 65) score -= 1;
 
-  // EMA 5m
-  if (e9 > e21 && e21 > e50) { score += 2; bullCount++; checks.ema = "bull"; }
-  else if (e9 < e21 && e21 < e50) { score -= 2; bearCount++; checks.ema = "bear"; }
-  else if (e9 > e21) { score += 0.5; checks.ema = "bull-weak"; }
-  else { score -= 0.5; checks.ema = "bear-weak"; }
+  if (M.bullish) score += 1.5;
+  else score -= 1.5;
 
-  // VWAP
-  if (price > vw * 1.003) { score += 1.5; bullCount++; checks.vwap = "above"; }
-  else if (price < vw * 0.997) { score -= 1.5; bearCount++; checks.vwap = "below"; }
+  if (e9 > e21 && e21 > e50) score += 2;
+  if (e9 < e21 && e21 < e50) score -= 2;
 
-  // ADX
-  if (adxData.trending) {
-    if (adxData.plusDI > adxData.minusDI * 1.2) { score += 1; checks.adx = "bull-trend"; }
-    else if (adxData.minusDI > adxData.plusDI * 1.2) { score -= 1; checks.adx = "bear-trend"; }
-  }
+  if (price > vw) score += 1;
+  else score -= 1;
 
-  // Supertrend
-  if (st.trend === "bull") { score += 1; bullCount++; checks.supertrend = "bull"; }
-  else if (st.trend === "bear") { score -= 1; bearCount++; checks.supertrend = "bear"; }
+  if (st.trend === "bull") score += 1;
+  if (st.trend === "bear") score -= 1;
 
-  // Bollinger
-  if (price <= bb.lower * 1.005 && R < 35) { score += 1; checks.bb = "oversold-bounce"; }
-  else if (price >= bb.upper * 0.995 && R > 65) { score -= 1; checks.bb = "overbought-rejection"; }
+  // HTF boost
+  if (trend15m === "bullish") score += 1;
+  if (trend15m === "bearish") score -= 1;
 
-  // Patterns
-  if (isBullishEngulfing || isHammer) { score += 1; bullCount++; checks.pattern = isBullishEngulfing ? "engulfing" : "hammer"; }
-  else if (isBearishEngulfing || isShootingStar) { score -= 1; bearCount++; checks.pattern = isBearishEngulfing ? "engulfing-bear" : "shooting-star"; }
-
-  // ─── REQ 3: HTF confirmation BOOST ───
-  if (trend15m === "bullish") score += 0.75;
-  else if (trend15m === "bearish") score -= 0.75;
   if (trendDaily === "bullish") score += 1;
-  else if (trendDaily === "bearish") score -= 1;
+  if (trendDaily === "bearish") score -= 1;
 
-  // ─── REQ 5: Index trend BOOST ───
-  if (relevantIndex === "bullish") score += 0.5;
-  else if (relevantIndex === "bearish") score -= 0.5;
+  // Index filter
+  if (indexTrend === "bullish") score += 0.5;
+  if (indexTrend === "bearish") score -= 0.5;
 
-  // Volume
-  if (volRatio > 1.5) score *= 1.1;
-  else if (volRatio < 0.7) score *= 0.7;
-
-  // Determine signal
-  const sb = relaxed ? 2.0 : CONFIG.SIGNAL_SCORE_BUY;
-  const ss = relaxed ? -2.0 : CONFIG.SIGNAL_SCORE_SELL;
-  const mc = relaxed ? 2 : CONFIG.MIN_CONFLUENCE;
-
-  let signal = "HOLD", confidence = 50;
-  if (score >= sb) { signal = "BUY"; confidence = Math.min(55 + score * 3, 85); }
-  else if (score <= ss) { signal = "SELL"; confidence = Math.min(55 + Math.abs(score) * 3, 82); }
-
-  const maxConf = Math.max(bullCount, bearCount);
-  
-  // ─── REQ 5: Block BUY if Nifty bearish, SELL if Nifty bullish (unless relaxed) ───
-  let indexFilter = true;
-  if (!relaxed) {
-    if (signal === "BUY" && relevantIndex === "bearish") indexFilter = false;
-    if (signal === "SELL" && relevantIndex === "bullish") indexFilter = false;
+  // Volume filter
+  if (volRatio < 1.5 && !relaxed) {
+    return { rejected: true, reason: "Low volume" };
   }
 
-  const filtersPassed = {
-    confluence: maxConf >= mc,
-    volume: volRatio >= (relaxed ? 1.0 : CONFIG.MIN_VOLUME_RATIO),
-    strength: Math.abs(score) >= Math.abs(sb),
-    confidence: confidence >= (relaxed ? 55 : CONFIG.MIN_CONFIDENCE),
-    trend: relaxed ? true : adxData.adx >= CONFIG.MIN_ADX,
-    htfAlign: relaxed ? true : (signal === "BUY" ? trend15m !== "bearish" && trendDaily !== "bearish" : trend15m !== "bullish" && trendDaily !== "bullish"),
-    indexAlign: indexFilter,
-  };
-  const safeToTrade = Object.values(filtersPassed).every(Boolean);
+  // 🎯 SIGNAL DECISION
+  let signal = "HOLD";
 
-  // ATR-based SL/Target
+  if (score >= CONFIG.SIGNAL_SCORE_BUY) signal = "BUY";
+  if (score <= CONFIG.SIGNAL_SCORE_SELL) signal = "SELL";
+
+  if (signal === "BUY" && !isBreakoutBuy) {
+    return { rejected: true, reason: "No breakout" };
+  }
+
+  if (signal === "SELL" && !isBreakoutSell) {
+    return { rejected: true, reason: "No breakdown" };
+  }
+
+  if (signal === "HOLD") {
+    return { rejected: true, reason: "Weak score" };
+  }
+
+  // 🎯 SL / TARGET
   const stopDist = Math.max(price * CONFIG.SL_PCT, a * CONFIG.ATR_SL_MULT);
   const targetDist = Math.max(price * CONFIG.TARGET_PCT, a * CONFIG.ATR_TARGET_MULT);
-  
-  // REQ 13: Position sizing using dynamic capital
-  const riskAmount = state.capital * CONFIG.RISK_PCT;
-  const qty = Math.max(1, Math.floor(riskAmount / stopDist));
-  
-  const entry = parseFloat(price.toFixed(2));
-  const sl = parseFloat((signal === "BUY" ? price - stopDist : price + stopDist).toFixed(2));
-  const target = parseFloat((signal === "BUY" ? price + targetDist : price - targetDist).toFixed(2));
+
+  const entry = price;
+  const sl = signal === "BUY" ? price - stopDist : price + stopDist;
+  const target = signal === "BUY" ? price + targetDist : price - targetDist;
+
+  // 🎯 RISK-REWARD FILTER
+  const risk = Math.abs(entry - sl);
+  const reward = Math.abs(target - entry);
+  const rr = reward / risk;
+
+  if (rr < 2) {
+    return { rejected: true, reason: "Low RR" };
+  }
 
   return {
-    id: `${symbol}-${Date.now()}`,
-    symbol, signal,
-    confidence: parseFloat(confidence.toFixed(1)),
-    score: parseFloat(score.toFixed(2)),
-    orderType: CONFIG.ORDER_TYPE,  // Always DELIVERY
+    symbol,
+    signal,
+    entry: +entry.toFixed(2),
+    sl: +sl.toFixed(2),
+    target: +target.toFixed(2),
+    score: +score.toFixed(2),
+    rr: +rr.toFixed(2),
     indicators: {
-      rsi: parseFloat(R.toFixed(1)),
-      vwap: parseFloat(vw.toFixed(2)),
-      adx: parseFloat(adxData.adx.toFixed(1)),
-      supertrend: st.trend,
-      atr: parseFloat(a.toFixed(2)),
-      volRatio: parseFloat(volRatio.toFixed(2)),
-      pattern: checks.pattern || "none",
-      checks,
-      trend15m, trendDaily,
-      indexTrend: relevantIndex,
+      rsi: +R.toFixed(1),
+      adx: +adxData.adx.toFixed(1),
+      volRatio: +volRatio.toFixed(2),
+      trend15m,
+      trendDaily,
+      indexTrend
     },
-    bullCount, bearCount, filtersPassed, safeToTrade,
-    entry, sl, target, qty,
-    capital: qty * entry,
-    riskAmount: parseFloat(riskAmount.toFixed(2)),
-    maxLoss: qty * stopDist,
-    maxGain: qty * targetDist,
-    relaxed, timestamp: Date.now(), rejected: false,
+    safeToTrade: true,
+    rejected: false
   };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// REQ 7: Balance check + suggestion
+// REQ 7: Balance check + suggesfvtion
 // ═══════════════════════════════════════════════════════════════════════════
 async function fetchBalance() {
   const age = Date.now() - state.balanceCacheTime;
