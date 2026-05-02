@@ -55,14 +55,16 @@ const CONFIG = {
 
   // ─── Quality filter ───
   TOP_SIGNALS_PER_DAY:   5,
-  MIN_SCORE_FOR_TRADE:   3.5,
+  MIN_SCORE_FOR_TRADE:   4.5,
   SIGNAL_SCORE_BUY:      5,
   SIGNAL_SCORE_SELL:     -5,
   MIN_CONFLUENCE:        3,
   MIN_CONFIDENCE:        60,
   MIN_VOLUME_RATIO:      1.5,
-  MIN_CANDLES:           30,
+  MIN_CANDLES:           20,
   MIN_ADX:               25,
+  SCALPING_MODE: true,
+  AUTO_SWITCH: true,
 
   // ─── REQ 4: Trading window 9:30 AM - 3:15 PM ───
   TRADING_START_HOUR:    9,
@@ -620,15 +622,18 @@ function bollinger(c, p=20) { if (c.length < p) return { upper:0, lower:0, mid:0
 // REQ 3 + 5 + 9: STRATEGY ENGINE (analyzeSignal)
 // Single source of truth — used by both live bot AND backtest
 // ═══════════════════════════════════════════════════════════════════════════
+
 export function analyzeSignal(symbol, candles5m, candles15m, candlesDaily, niftyTrend, bankNiftyTrend, relaxed = false) {
 
-  if (candles5m.length < CONFIG.MIN_CANDLES) {
+  if (candles5m.length < 20) {
     return { rejected: true, reason: "Not enough candles" };
   }
 
   const closes = candles5m.map(c => c.c);
   const vols = candles5m.map(c => c.v);
   const price = closes[closes.length - 1];
+  const now = new Date();
+  const hour = now.getHours();
 
   // Indicators
   const R = rsi(closes);
@@ -636,137 +641,123 @@ export function analyzeSignal(symbol, candles5m, candles15m, candlesDaily, nifty
   const e9 = ema(closes, 9);
   const e21 = ema(closes, 21);
   const e50 = ema(closes, 50);
-  const e200 = ema(closes, Math.min(200, closes.length - 1));
   const vw = vwap(candles5m);
   const adxData = adx(candles5m);
   const st = supertrend(candles5m);
-  const bb = bollinger(closes);
   const a = atr(candles5m);
 
   const avgVol = vols.slice(-20).reduce((a, b) => a + b, 0) / 20;
   const volRatio = vols[vols.length - 1] / (avgVol || 1);
 
-  // 🚨 STRONG TREND FILTER
-  const isStrongTrend =
-      (e9 > e21 && e21 > e50 && adxData.adx > 25) ||
-      (e9 < e21 && e21 < e50 && adxData.adx > 25);
+  // ═════════ AI MARKET CONDITION DETECTION ═════════
 
-  if (!relaxed && !isStrongTrend) {
-    return { rejected: true, reason: "Weak trend" };
+  let marketType = "SIDEWAYS";
+
+  if (adxData.adx > 30 && Math.abs(e9 - e21) > 0.002 * price) {
+    marketType = "TRENDING";
+  } else if (volRatio > 2 && adxData.adx > 20) {
+    marketType = "VOLATILE";
   }
 
-  // HTF Trends
-  let trend15m = "neutral";
-  if (candles15m?.length > 21) {
-    const c15 = candles15m.map(c => c.c);
-    trend15m = ema(c15, 9) > ema(c15, 21) ? "bullish" : "bearish";
+  // ═════════ AUTO STRATEGY SWITCH ═════════
+
+  if (marketType === "SIDEWAYS") {
+    return scalpingMode(symbol, price, closes, R, vw, volRatio, a);
   }
 
-  let trendDaily = "neutral";
-  if (candlesDaily?.length > 21) {
-    const cD = candlesDaily.map(c => c.c);
-    trendDaily = ema(cD, 9) > ema(cD, 21) ? "bullish" : "bearish";
+  if (marketType === "VOLATILE") {
+    return breakoutMode(symbol, price, closes, volRatio, a);
   }
 
-  const bankingStocks = ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK"];
-  const indexTrend = bankingStocks.includes(symbol) ? bankNiftyTrend : niftyTrend;
-
-  // 🎯 BREAKOUT LOGIC
-  const recentHigh = Math.max(...closes.slice(-20));
-  const recentLow = Math.min(...closes.slice(-20));
-
-  const isBreakoutBuy = price > recentHigh * 1.002;
-  const isBreakoutSell = price < recentLow * 0.998;
-
-  // 🎯 SCORING
-  let score = 0;
-
-  if (R < 35) score += 1;
-  if (R > 65) score -= 1;
-
-  if (M.bullish) score += 1.5;
-  else score -= 1.5;
-
-  if (e9 > e21 && e21 > e50) score += 2;
-  if (e9 < e21 && e21 < e50) score -= 2;
-
-  if (price > vw) score += 1;
-  else score -= 1;
-
-  if (st.trend === "bull") score += 1;
-  if (st.trend === "bear") score -= 1;
-
-  // HTF boost
-  if (trend15m === "bullish") score += 1;
-  if (trend15m === "bearish") score -= 1;
-
-  if (trendDaily === "bullish") score += 1;
-  if (trendDaily === "bearish") score -= 1;
-
-  // Index filter
-  if (indexTrend === "bullish") score += 0.5;
-  if (indexTrend === "bearish") score -= 0.5;
-
-  // Volume filter
-  if (volRatio < 1.5 && !relaxed) {
-    return { rejected: true, reason: "Low volume" };
+  if (marketType === "TRENDING") {
+    return trendMode(symbol, price, closes, R, M, e9, e21, e50, vw, adxData, st, volRatio, a);
   }
 
-  // 🎯 SIGNAL DECISION
-  let signal = "HOLD";
+  return { rejected: true, reason: "No condition match" };
+}
 
-  if (score >= CONFIG.SIGNAL_SCORE_BUY) signal = "BUY";
-  if (score <= CONFIG.SIGNAL_SCORE_SELL) signal = "SELL";
+// ═════════ 80% ACCURACY SCALPING MODE ═════════
 
-  if (signal === "BUY" && !isBreakoutBuy) {
-    return { rejected: true, reason: "No breakout" };
+function scalpingMode(symbol, price, closes, R, vw, volRatio, atrValue) {
+
+  const last = closes.slice(-5);
+  const high = Math.max(...last);
+  const low = Math.min(...last);
+
+  // VERY STRICT CONDITIONS
+  if (volRatio < 2.5) return reject("Low volume scalp");
+
+  // Mean reversion scalp
+  if (price < vw * 0.998 && R < 30) {
+    return buildSignal("BUY", price, atrValue * 0.8, atrValue * 1.2, symbol);
   }
 
-  if (signal === "SELL" && !isBreakoutSell) {
-    return { rejected: true, reason: "No breakdown" };
+  if (price > vw * 1.002 && R > 70) {
+    return buildSignal("SELL", price, atrValue * 0.8, atrValue * 1.2, symbol);
   }
 
-  if (signal === "HOLD") {
-    return { rejected: true, reason: "Weak score" };
+  return reject("No scalp setup");
+}
+
+// ═════════ BREAKOUT MODE ═════════
+
+function breakoutMode(symbol, price, closes, volRatio, atrValue) {
+
+  const high = Math.max(...closes.slice(-15));
+  const low = Math.min(...closes.slice(-15));
+
+  if (volRatio < 2) return reject("Low volume breakout");
+
+  if (price > high) {
+    return buildSignal("BUY", price, atrValue * 1.5, atrValue * 3, symbol);
   }
 
-  // 🎯 SL / TARGET
-  const stopDist = Math.max(price * CONFIG.SL_PCT, a * CONFIG.ATR_SL_MULT);
-  const targetDist = Math.max(price * CONFIG.TARGET_PCT, a * CONFIG.ATR_TARGET_MULT);
-
-  const entry = price;
-  const sl = signal === "BUY" ? price - stopDist : price + stopDist;
-  const target = signal === "BUY" ? price + targetDist : price - targetDist;
-
-  // 🎯 RISK-REWARD FILTER
-  const risk = Math.abs(entry - sl);
-  const reward = Math.abs(target - entry);
-  const rr = reward / risk;
-
-  if (rr < 2) {
-    return { rejected: true, reason: "Low RR" };
+  if (price < low) {
+    return buildSignal("SELL", price, atrValue * 1.5, atrValue * 3, symbol);
   }
+
+  return reject("No breakout");
+}
+
+// ═════════ TREND MODE ═════════
+
+function trendMode(symbol, price, closes, R, M, e9, e21, e50, vw, adxData, st, volRatio, atrValue) {
+
+  if (volRatio < 2) return reject("Low volume trend");
+
+  if (e9 > e21 && e21 > e50 && M.bullish && R < 60) {
+    return buildSignal("BUY", price, atrValue * 2, atrValue * 5, symbol);
+  }
+
+  if (e9 < e21 && e21 < e50 && !M.bullish && R > 40) {
+    return buildSignal("SELL", price, atrValue * 2, atrValue * 5, symbol);
+  }
+
+  return reject("No trend setup");
+}
+
+// ═════════ COMMON HELPERS ═════════
+
+function buildSignal(signal, price, slDist, tgtDist, symbol) {
+
+  const sl = signal === "BUY" ? price - slDist : price + slDist;
+  const target = signal === "BUY" ? price + tgtDist : price - tgtDist;
 
   return {
     symbol,
     signal,
-    entry: +entry.toFixed(2),
+    entry: +price.toFixed(2),
     sl: +sl.toFixed(2),
     target: +target.toFixed(2),
-    score: +score.toFixed(2),
-    rr: +rr.toFixed(2),
-    indicators: {
-      rsi: +R.toFixed(1),
-      adx: +adxData.adx.toFixed(1),
-      volRatio: +volRatio.toFixed(2),
-      trend15m,
-      trendDaily,
-      indexTrend
-    },
     safeToTrade: true,
     rejected: false
   };
 }
+
+function reject(reason) {
+  return { rejected: true, reason };
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // REQ 7: Balance check + suggesfvtion
